@@ -472,7 +472,7 @@ def save_to_db(neurons, synapses, pair_counts, params, db_path, rng):
     # Import V8 schema
     v8_path = os.path.join(os.path.dirname(BASE), 'inner-models-v8')
     sys.path.insert(0, v8_path)
-    from schema import create_db
+    from schema import create_brain_db
 
     n = neurons['n']
     jitter = params['param_jitter']
@@ -486,7 +486,7 @@ def save_to_db(neurons, synapses, pair_counts, params, db_path, rng):
         'ch':  {'a': 0.02,  'b': 0.2,  'c': -50.0, 'd': 2.0},
     }
 
-    conn = create_db(db_path)
+    conn = create_brain_db(db_path)
 
     # Insert neurons
     for i in range(n):

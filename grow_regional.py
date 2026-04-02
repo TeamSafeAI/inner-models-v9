@@ -201,7 +201,7 @@ def grow_regional_axons(neurons, regions, params, rng):
     turn_rate = params.get('turn_rate', 0.3)
     contact_radius = params.get('contact_radius', 10.0)
     max_syn_pair = params.get('max_synapses_per_pair', 12)
-    inh_pref = params.get('inh_exc_preference', 2.5)
+    inh_target_exc_prob = params.get('inh_target_exc_prob', 0.78)  # H01: 78% of INH targets are EXC
 
     # Build spatial grid
     grid_size = 50.0  # um
@@ -284,35 +284,30 @@ def grow_regional_axons(neurons, regions, params, rng):
                 px, py, pz, dx, dy, dz = cone
 
                 # Contact check
-                eff_radius = contact_radius * inh_pref if is_inh else contact_radius
-                nearby = get_nearby(px, py, pz, eff_radius)
+                nearby = get_nearby(px, py, pz, contact_radius)
                 for tgt, dist in nearby:
                     if tgt == src:
                         continue
-                    # Inhibitory preference for excitatory targets
-                    actual_radius = contact_radius
-                    if is_inh and cell_types[tgt] == 'EXC':
-                        actual_radius = contact_radius * inh_pref
-                    if dist < actual_radius:
-                        pair = (src, tgt)
-                        count = pair_counts.get(pair, 0)
-                        if count >= max_syn_pair:
-                            continue
-                        synapses.append(pair)
-                        pair_counts[pair] = count + 1
-
-                # Steering: local chemoattraction + regional signals
-                local = get_nearby(px, py, pz, 80.0)
-                ax, ay, az = 0.0, 0.0, 0.0
-                for tgt, dist in local:
-                    if tgt == src or dist < 1.0:
+                    # INH preferential targeting: 78% chance to connect if EXC, 22% if INH
+                    if is_inh:
+                        tgt_is_exc = cell_types[tgt] == 'EXC'
+                        if tgt_is_exc:
+                            if rng.random() > inh_target_exc_prob:
+                                continue
+                        else:
+                            if rng.random() > (1.0 - inh_target_exc_prob):
+                                continue
+                    pair = (src, tgt)
+                    count = pair_counts.get(pair, 0)
+                    if count >= max_syn_pair:
                         continue
-                    weight = 1.0 / (dist * dist)
-                    ax += (x[tgt] - px) * weight
-                    ay += (y[tgt] - py) * weight
-                    az += (z[tgt] - pz) * weight
+                    synapses.append(pair)
+                    pair_counts[pair] = count + 1
 
-                # Also steer toward distant region centers
+                # Steering: region centers (fast) + occasional local attraction
+                ax, ay, az = 0.0, 0.0, 0.0
+
+                # Steer toward distant region centers (cheap, always)
                 for rname, center in region_centers.items():
                     to_r = center - np.array([px, py, pz])
                     d_r = np.linalg.norm(to_r)
@@ -321,6 +316,17 @@ def grow_regional_axons(neurons, regions, params, rng):
                         ax += to_r[0] / d_r * w
                         ay += to_r[1] / d_r * w
                         az += to_r[2] / d_r * w
+
+                # Local cell-level attraction every 5 steps (expensive)
+                if step % 5 == 0:
+                    local = get_nearby(px, py, pz, 40.0)
+                    for tgt, dist in local:
+                        if tgt == src or dist < 1.0:
+                            continue
+                        weight = 1.0 / (dist * dist)
+                        ax += (x[tgt] - px) * weight
+                        ay += (y[tgt] - py) * weight
+                        az += (z[tgt] - pz) * weight
 
                 norm = np.sqrt(ax*ax + ay*ay + az*az)
                 if norm > 1e-10:
@@ -416,17 +422,215 @@ def analyze_regional(neurons, synapses, regions):
               f"ratio={in_per/max(out_per,0.01):.2f}")
 
 
+def save_regional_db(neurons, synapses, pair_counts, params, regions_used, db_path, rng):
+    """Save grown regional network to V8-compatible SQLite database."""
+    v8_path = os.path.join(os.path.dirname(BASE), 'inner-models-v8')
+    sys.path.insert(0, v8_path)
+    from schema import create_brain_db
+
+    n = neurons['n']
+    jitter = params.get('param_jitter', 0.15)
+
+    TYPE_PARAMS = {
+        'rs':  {'a': 0.02,  'b': 0.2,  'c': -65.0, 'd': 8.0},
+        'fs':  {'a': 0.1,   'b': 0.2,  'c': -65.0, 'd': 2.0},
+        'ib':  {'a': 0.02,  'b': 0.2,  'c': -55.0, 'd': 4.0},
+        'lts': {'a': 0.02,  'b': 0.25, 'c': -65.0, 'd': 2.0},
+        'ch':  {'a': 0.02,  'b': 0.2,  'c': -50.0, 'd': 2.0},
+    }
+
+    conn = create_brain_db(db_path)
+
+    # Insert neurons with region metadata
+    for i in range(n):
+        nt = neurons['neuron_types'][i]
+        base = TYPE_PARAMS[nt]
+        a = base['a'] * (1 + rng.uniform(-jitter, jitter))
+        b = base['b'] * (1 + rng.uniform(-jitter, jitter))
+        c = base['c'] * (1 + rng.uniform(-jitter, jitter))
+        d = base['d'] * (1 + rng.uniform(-jitter, jitter))
+
+        # D1/D2 by region -- basal_ganglia gets strong D1/D2, others mixed
+        region = neurons['regions'][i]
+        if region == 'basal_ganglia':
+            r = rng.random()
+            dopa_sens = rng.uniform(0.5, 1.0) if r < 0.5 else rng.uniform(-1.0, -0.5)
+        elif region in ('amygdala', 'cortex'):
+            dopa_sens = rng.uniform(-0.5, 0.5)
+        else:
+            dopa_sens = rng.uniform(-0.2, 0.2)
+
+        conn.execute(
+            """INSERT INTO neurons
+               (neuron_type, a, b, c, d, v, u, last_spike,
+                pos_x, pos_y, pos_z, dopamine_sens, excitability, activity_trace)
+               VALUES (?, ?, ?, ?, ?, -65, ?, -1000, ?, ?, ?, ?, 0, 0)""",
+            (nt, a, b, c, d, b * -65.0,
+             neurons['x'][i], neurons['y'][i], neurons['z'][i],
+             dopa_sens)
+        )
+
+    db_ids = [row[0] for row in conn.execute("SELECT id FROM neurons ORDER BY id")]
+    idx_to_id = {i: db_ids[i] for i in range(n)}
+
+    cell_types = neurons['cell_types']
+    region_labels = neurons['regions']
+
+    for (src, tgt), n_contacts in pair_counts.items():
+        src_exc = cell_types[src] == 'EXC'
+        src_region = region_labels[src]
+        tgt_region = region_labels[tgt]
+
+        # Weight: base scaled by contacts
+        if src_exc:
+            base_w = 2.0
+        else:
+            base_w = -2.5
+        weight = base_w * (1.0 + 0.3 * (n_contacts - 1))
+
+        # Synapse type: cross-region excitatory = reward_plastic
+        if src_exc and src_region != tgt_region:
+            syn_type = 'reward_plastic'
+        elif src_exc:
+            syn_type = 'plastic'
+        else:
+            syn_type = 'fixed'
+
+        # Distance-based delay
+        d = np.sqrt((neurons['x'][src] - neurons['x'][tgt])**2 +
+                     (neurons['y'][src] - neurons['y'][tgt])**2 +
+                     (neurons['z'][src] - neurons['z'][tgt])**2)
+        delay = max(1, int(d / 50.0))
+
+        params_json = json.dumps({'n_contacts': n_contacts, 'src_region': src_region, 'tgt_region': tgt_region})
+
+        conn.execute(
+            """INSERT INTO synapses
+               (source, target, synapse_type, weight, delay, params, state)
+               VALUES (?, ?, ?, ?, ?, ?, '{}')""",
+            (idx_to_id[src], idx_to_id[tgt], syn_type, abs(weight), delay, params_json)
+        )
+
+    conn.commit()
+
+    n_syn = conn.execute("SELECT COUNT(*) FROM synapses").fetchone()[0]
+    n_reward = conn.execute("SELECT COUNT(*) FROM synapses WHERE synapse_type='reward_plastic'").fetchone()[0]
+    n_plastic = conn.execute("SELECT COUNT(*) FROM synapses WHERE synapse_type='plastic'").fetchone()[0]
+    n_fixed = conn.execute("SELECT COUNT(*) FROM synapses WHERE synapse_type='fixed'").fetchone()[0]
+
+    conn.close()
+
+    print(f"\n  Saved to: {db_path}")
+    print(f"  {n} neurons, {n_syn} unique-pair synapses")
+    print(f"  Types: {n_fixed} fixed, {n_plastic} plastic, {n_reward} reward_plastic")
+
+    return db_path
+
+
+def auto_contact_radius(n_neurons, regions):
+    """Estimate contact_radius to yield ~10-15 synapses per neuron.
+
+    Synapse count scales roughly as contact_radius^3 * density * steps * branches.
+    We use a conservative formula since too-many is worse than too-few
+    (too-few still produces interesting topology, too-many is noise).
+    """
+    # Effective volume from all region spheres
+    total_vol = 0
+    for rinfo in regions.values():
+        r = rinfo['radius']
+        total_vol += (4/3) * np.pi * r**3
+
+    density = n_neurons / total_vol
+
+    # Target: ~12 synapses per neuron
+    # Empirical: at density ~8e-5 N/um^3, radius 2.0um works for ~10-15 syn/N
+    # Scale: r ~ (target_density / actual_density)^(1/3) * base_r
+    ref_density = 8e-5
+    ref_radius = 2.0
+
+    auto_r = ref_radius * (ref_density / density) ** (1/3)
+
+    # Clamp to reasonable range
+    auto_r = max(1.5, min(auto_r, 6.0))
+    return auto_r
+
+
 def main():
     p = argparse.ArgumentParser(description='Grow a regional brain')
     p.add_argument('--neurons', type=int, default=8000)
     p.add_argument('--seed', type=int, default=42)
-    p.add_argument('--steps', type=int, default=150)
-    p.add_argument('--contact-radius', type=float, default=10.0)
+    p.add_argument('--steps', type=int, default=100)
+    p.add_argument('--contact-radius', type=float, default=None,
+                   help='Contact radius in um (auto-scaled if not set)')
     p.add_argument('--branch-prob', type=float, default=0.04)
     p.add_argument('--name', default=None)
+    p.add_argument('--save', action='store_true', default=True)
+    p.add_argument('--no-save', action='store_true')
+    p.add_argument('--config', default=None,
+                   help='Region config preset: balanced, cortex_heavy, memory_dense, thalamic_hub, spread')
     args = p.parse_args()
 
     rng = np.random.RandomState(args.seed)
+
+    # Select region configuration
+    regions = dict(REGIONS)  # deep copy
+    regions = {k: dict(v) for k, v in regions.items()}
+
+    if args.config == 'cortex_heavy':
+        regions['cortex']['n_fraction'] = 0.50
+        regions['cortex']['attractant'] = 1.5
+        regions['cortex']['radius'] = 180
+        regions['hippocampus']['n_fraction'] = 0.10
+        regions['sensory']['n_fraction'] = 0.05
+        regions['brainstem']['n_fraction'] = 0.08
+        regions['basal_ganglia']['n_fraction'] = 0.09
+        regions['thalamus']['n_fraction'] = 0.10
+        regions['amygdala']['n_fraction'] = 0.08
+    elif args.config == 'memory_dense':
+        regions['hippocampus']['n_fraction'] = 0.25
+        regions['hippocampus']['local_density'] = 3.0
+        regions['hippocampus']['attractant'] = 2.0
+        regions['amygdala']['n_fraction'] = 0.15
+        regions['amygdala']['attractant'] = 2.5
+        regions['cortex']['n_fraction'] = 0.25
+        regions['basal_ganglia']['n_fraction'] = 0.10
+        regions['thalamus']['n_fraction'] = 0.10
+        regions['brainstem']['n_fraction'] = 0.08
+        regions['sensory']['n_fraction'] = 0.07
+    elif args.config == 'thalamic_hub':
+        regions['thalamus']['attractant'] = 3.5
+        regions['thalamus']['n_fraction'] = 0.15
+        regions['thalamus']['radius'] = 80
+        regions['brainstem']['attractant'] = 1.5
+        regions['cortex']['attractant'] = 0.7
+        regions['cortex']['n_fraction'] = 0.30
+        regions['hippocampus']['n_fraction'] = 0.12
+        regions['amygdala']['n_fraction'] = 0.08
+        regions['basal_ganglia']['n_fraction'] = 0.10
+        regions['sensory']['n_fraction'] = 0.07
+        regions['brainstem']['n_fraction'] = 0.18
+    elif args.config == 'spread':
+        for rn in regions:
+            regions[rn]['radius'] = int(regions[rn]['radius'] * 1.5)
+            regions[rn]['local_density'] = max(0.5, regions[rn]['local_density'] * 0.7)
+            regions[rn]['attractant'] = regions[rn]['attractant'] * 0.8
+    elif args.config == 'amygdala_driven':
+        regions['amygdala']['n_fraction'] = 0.18
+        regions['amygdala']['attractant'] = 3.0
+        regions['amygdala']['radius'] = 80
+        regions['basal_ganglia']['n_fraction'] = 0.15
+        regions['basal_ganglia']['attractant'] = 1.2
+        regions['cortex']['n_fraction'] = 0.25
+        regions['hippocampus']['n_fraction'] = 0.12
+        regions['thalamus']['n_fraction'] = 0.10
+        regions['brainstem']['n_fraction'] = 0.12
+        regions['sensory']['n_fraction'] = 0.08
+
+    # Auto-calculate contact radius if not specified
+    if args.contact_radius is None:
+        cr = auto_contact_radius(args.neurons, regions)
+    else:
+        cr = args.contact_radius
 
     params = {
         'axon_steps': args.steps,
@@ -434,33 +638,44 @@ def main():
         'branch_prob': args.branch_prob,
         'max_branches': 8,
         'turn_rate': 0.3,
-        'contact_radius': args.contact_radius,
+        'contact_radius': cr,
         'max_synapses_per_pair': 12,
-        'inh_exc_preference': 2.5,
+        'inh_target_exc_prob': 0.78,
+        'param_jitter': 0.15,
     }
 
+    config_label = args.config or 'balanced'
     print(f"{'='*60}")
     print(f"  V9 REGIONAL BRAIN GROWTH")
+    print(f"  Config: {config_label}")
     print(f"  Neurons: {args.neurons}, Steps: {args.steps}")
-    print(f"  Contact: {args.contact_radius}um, Branch: {args.branch_prob}")
+    print(f"  Contact: {cr:.2f}um {'(auto)' if args.contact_radius is None else ''}, Branch: {args.branch_prob}")
     print(f"  Seed: {args.seed}")
-    print(f"  Regions: {', '.join(REGIONS.keys())}")
+    print(f"  Regions: {', '.join(regions.keys())}")
     print(f"{'='*60}")
 
     # 1. Place neurons
     print(f"\n  Placing neurons...")
-    neurons = place_regional_neurons(args.neurons, REGIONS, rng)
+    neurons = place_regional_neurons(args.neurons, regions, rng)
 
     # 2. Grow axons
     print(f"\n  Growing axons (this takes a while)...")
-    synapses, pair_counts = grow_regional_axons(neurons, REGIONS, params, rng)
+    synapses, pair_counts = grow_regional_axons(neurons, regions, params, rng)
 
     # 3. Analyze
-    analyze_regional(neurons, synapses, REGIONS)
+    analyze_regional(neurons, synapses, regions)
 
     # 4. General stats (import from grow.py)
     from grow import compute_stats
     compute_stats(neurons, synapses, pair_counts)
+
+    # 5. Save to DB
+    if args.save and not args.no_save:
+        name = args.name or f"regional_{config_label}_s{args.seed}"
+        db_dir = os.path.join(BASE, 'brains')
+        os.makedirs(db_dir, exist_ok=True)
+        db_path = os.path.join(db_dir, f"{name}.db")
+        save_regional_db(neurons, synapses, pair_counts, params, regions, db_path, rng)
 
     print(f"\n{'='*60}")
     print(f"  REGIONAL GROWTH COMPLETE")
