@@ -1,0 +1,59 @@
+{
+  "name": "regional_cortex_heavy_s42",
+  "neurons": 1000,
+  "synapses": 7877,
+  "reward_plastic": 2924,
+  "sessions": 3,
+  "ticks_per_session": 10000,
+  "mean_ci": 0.01986489734069224,
+  "ci_std": 0.013597968752380655,
+  "best_ci": 0.03351182112396671,
+  "worst_ci": 0.0013077985565052687,
+  "mean_spk_rate": 9.177566666666666,
+  "mean_motor": 7679.666666666667,
+  "final_w_mean": 2.4209230322527673,
+  "session_details": [
+    {
+      "ci": 0.0013077985565052687,
+      "start_dist": 19.999999999999996,
+      "end_dist": 19.97384402886989,
+      "total_spikes": 76684,
+      "motor_spikes": 7677,
+      "sensory_spikes": 16276,
+      "spikes_per_tick": 7.6684,
+      "reward_total": 0.0029684559164454283,
+      "w_mean": 2.4199667453648757,
+      "w_std": 0.7296141769029313,
+      "time_s": 53.971476400009124,
+      "ticks_per_sec": 185.28305443944294
+    },
+    {
+      "ci": 0.02477507234160475,
+      "start_dist": 16.07561720908784,
+      "end_dist": 15.677342629796744,
+      "total_spikes": 121383,
+      "motor_spikes": 7678,
+      "sensory_spikes": 56648,
+      "spikes_per_tick": 12.1383,
+      "reward_total": 0.08967205057985983,
+      "w_mean": 2.4219186826080774,
+      "w_std": 0.7293654648569325,
+      "time_s": 49.3671786999912,
+      "ticks_per_sec": 202.56373289571403
+    },
+    {
+      "ci": 0.03351182112396671,
+      "start_dist": 20.000000000000004,
+      "end_dist": 19.32976357752067,
+      "total_spikes": 77260,
+      "motor_spikes": 7684,
+      "sensory_spikes": 16868,
+      "spikes_per_tick": 7.726,
+      "reward_total": 0.12803001811873507,
+      "w_mean": 2.4209230322527673,
+      "w_std": 0.7295896905023106,
+      "time_s": 40.622012599997106,
+      "ticks_per_sec": 246.17194865427993
+    }
+  ]
+}

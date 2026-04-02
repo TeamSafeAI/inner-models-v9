@@ -1,0 +1,59 @@
+{
+  "name": "regional_thalamic_hub_s42",
+  "neurons": 1000,
+  "synapses": 6358,
+  "reward_plastic": 1961,
+  "sessions": 3,
+  "ticks_per_session": 10000,
+  "mean_ci": 0.026483637661732746,
+  "ci_std": 0.009994876456257764,
+  "best_ci": 0.03750535120740998,
+  "worst_ci": 0.013308728047768883,
+  "mean_spk_rate": 7.4815,
+  "mean_motor": 12652.333333333334,
+  "final_w_mean": 2.2626654588517967,
+  "session_details": [
+    {
+      "ci": 0.013308728047768883,
+      "start_dist": 19.999999999999996,
+      "end_dist": 19.73382543904462,
+      "total_spikes": 63692,
+      "motor_spikes": 12655,
+      "sensory_spikes": 11964,
+      "spikes_per_tick": 6.3692,
+      "reward_total": 0.04864800919505488,
+      "w_mean": 2.262299831600702,
+      "w_std": 0.5703330038330922,
+      "time_s": 46.67382930000895,
+      "ticks_per_sec": 214.25282969010823
+    },
+    {
+      "ci": 0.028636833730019372,
+      "start_dist": 16.07561720908784,
+      "end_dist": 15.615262431963755,
+      "total_spikes": 96601,
+      "motor_spikes": 12674,
+      "sensory_spikes": 43142,
+      "spikes_per_tick": 9.6601,
+      "reward_total": 0.10329805755584648,
+      "w_mean": 2.2641192962702674,
+      "w_std": 0.5702550180267315,
+      "time_s": 41.01896040000429,
+      "ticks_per_sec": 243.78969877547053
+    },
+    {
+      "ci": 0.03750535120740998,
+      "start_dist": 20.000000000000004,
+      "end_dist": 19.249892975851804,
+      "total_spikes": 64152,
+      "motor_spikes": 12628,
+      "sensory_spikes": 12393,
+      "spikes_per_tick": 6.4152,
+      "reward_total": 0.1384466384276771,
+      "w_mean": 2.2626654588517967,
+      "w_std": 0.5703573120266382,
+      "time_s": 46.55294570000842,
+      "ticks_per_sec": 214.80917801509156
+    }
+  ]
+}

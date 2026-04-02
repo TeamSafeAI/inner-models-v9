@@ -34,8 +34,8 @@ def run_session(db_path, ticks, tonic, seed):
     from worm_body import WormBody
 
     data = load(db_path)
-    n = data['n']
     brain = Brain(data, learn=True)
+    n = brain.n
     body_map = data.get('body_map', {})
     sensor_map = data.get('sensor_map', {})
 
