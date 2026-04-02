@@ -1,48 +1,60 @@
 {
-  "description": "V9 full-size overnight arena results (10 sessions x 30K ticks, tonic 2.8)",
+  "description": "V9 full-size arena results (tonic 2.8)",
   "date": "2026-04-02",
-  "note": "memory_dense and thalamic_hub incomplete (killed - CPU too slow)",
-  "completed_brains": {
+  "overnight_runs": {
+    "note": "10 sessions x 30K ticks each",
     "cortex_heavy": {
       "neurons": 8000, "synapses": 126371, "reward_plastic": 50825,
       "mean_ci": 0.073, "ci_std": 0.075, "best_ci": 0.154, "worst_ci": -0.113,
       "sessions_positive": 9, "sessions_total": 10,
-      "engine_speed_tps": "61-80",
       "session_cis": [0.033, 0.054, 0.079, -0.113, 0.154, 0.142, 0.074, 0.146, 0.112, 0.046]
     },
     "amygdala_driven": {
       "neurons": 8000, "synapses": 152012, "reward_plastic": 57220,
       "mean_ci": 0.028, "ci_std": 0.021, "best_ci": 0.062, "worst_ci": -0.014,
       "sessions_positive": 9, "sessions_total": 10,
-      "engine_speed_tps": "61-77",
       "session_cis": [0.024, 0.010, 0.044, -0.014, 0.062, 0.041, 0.025, 0.048, 0.031, 0.010]
     },
     "balanced": {
       "neurons": 8000, "synapses": 139763, "reward_plastic": 52851,
       "mean_ci": -0.723, "ci_std": 0.486, "best_ci": 0.053, "worst_ci": -1.473,
       "sessions_positive": 1, "sessions_total": 10,
-      "engine_speed_tps": "66-74",
       "session_cis": [-0.814, -1.399, -0.426, -0.298, -0.962, 0.053, -1.017, -1.473, -0.739, -0.156]
     }
   },
-  "incomplete_brains": {
-    "memory_dense": {
-      "neurons": 12000, "synapses": 399555, "reward_plastic": 100008,
-      "sessions_completed": 1, "s0_ci": 0.004, "engine_speed_tps": 9,
-      "reason_stopped": "9 t/s too slow, freezing user's machine"
-    },
+  "quick_runs": {
+    "note": "3 sessions x 10K ticks (completed after engine optimization)",
     "thalamic_hub": {
       "neurons": 10000, "synapses": 201131, "reward_plastic": 71622,
-      "sessions_completed": 0,
-      "reason_stopped": "never reached, killed before memory_dense finished"
+      "mean_ci": 0.026, "ci_std": 0.008, "best_ci": 0.032, "worst_ci": 0.015,
+      "sessions_positive": 3, "sessions_total": 3,
+      "session_cis": [0.032, 0.015, 0.030]
+    },
+    "memory_dense": {
+      "neurons": 12000, "synapses": 399555, "reward_plastic": 100008,
+      "mean_ci": 0.022, "ci_std": 0.024, "best_ci": 0.055, "worst_ci": 0.004,
+      "sessions_positive": 3, "sessions_total": 3,
+      "session_cis": [0.004, 0.055, 0.006]
+    }
+  },
+  "engine_optimization": {
+    "date": "2026-04-02",
+    "method": "CSR indptr for plastic/reward STDP + vectorized delivery arrays",
+    "speedups": {
+      "cortex_heavy_8K": {"old_tps": "61-80", "new_tps": 1257, "speedup": "16-21x"},
+      "amygdala_driven_8K": {"old_tps": "61-77", "new_tps": 1075, "speedup": "14-18x"},
+      "balanced_8K": {"old_tps": "66-74", "new_tps": 805, "speedup": "11-12x"},
+      "thalamic_hub_10K": {"old_tps": "n/a", "new_tps": 546},
+      "memory_dense_12K": {"old_tps": 9, "new_tps": 248, "speedup": "27.5x"}
     }
   },
   "key_findings": [
     "cortex_heavy BEST: +0.073 mean CI, 9/10 positive. 50% cortex with strong association areas.",
     "amygdala_driven GOOD: +0.028 mean CI, 9/10 positive. Emotional fast-path works.",
+    "thalamic_hub OK: +0.026 mean CI, 3/3 positive. Thalamus relay works but no advantage over simpler architectures.",
+    "memory_dense OK: +0.022 mean CI, 3/3 positive. 400K synapses not clearly better than 126K cortex_heavy.",
     "balanced BROKEN: -0.723 mean CI, actively fleeing food. Thalamus hub 3.41x too dominant.",
     "All wiring emerged from growth alone - zero designed connections.",
-    "KDTree optimization: 28x speedup (1 N/s -> 28 N/s). Build 8K brain in 5 min.",
-    "memory_dense at 12K/400K syn = 9 t/s. Too slow for current hardware. Need engine optimization or smaller brain."
+    "Engine optimization: 15-28x speedup via CSR indptr structure. 12K brain went from 9 to 248 t/s."
   ]
 }
