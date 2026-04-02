@@ -445,6 +445,7 @@ def save_regional_db(neurons, synapses, pair_counts, params, regions_used, db_pa
     for i in range(n):
         nt = neurons['neuron_types'][i]
         base = TYPE_PARAMS[nt]
+        nt_upper = nt.upper()  # V8 engine expects uppercase
         a = base['a'] * (1 + rng.uniform(-jitter, jitter))
         b = base['b'] * (1 + rng.uniform(-jitter, jitter))
         c = base['c'] * (1 + rng.uniform(-jitter, jitter))
@@ -465,7 +466,7 @@ def save_regional_db(neurons, synapses, pair_counts, params, regions_used, db_pa
                (neuron_type, a, b, c, d, v, u, last_spike,
                 pos_x, pos_y, pos_z, dopamine_sens, excitability, activity_trace)
                VALUES (?, ?, ?, ?, ?, -65, ?, -1000, ?, ?, ?, ?, 0, 0)""",
-            (nt, a, b, c, d, b * -65.0,
+            (nt_upper, a, b, c, d, b * -65.0,
              neurons['x'][i], neurons['y'][i], neurons['z'][i],
              dopa_sens)
         )

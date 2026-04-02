@@ -67,20 +67,20 @@ def validate_db(db_path):
 def validate_engine(db_path, tonic=2.8, ticks=1000):
     """Load brain into V8 engine and run a short test."""
     try:
-        from engine.loader import load_brain
+        from engine.loader import load
         from engine.runner import Brain
     except ImportError as e:
         print(f"    SKIP engine test: {e}")
         return None
 
     try:
-        data = load_brain(db_path)
+        data = load(db_path)
     except Exception as e:
         print(f"    FAIL load: {e}")
         return {'loaded': False, 'error': str(e)}
 
-    n = data['n']
     brain = Brain(data)
+    n = brain.n
 
     I_ext = np.full(n, tonic)
     total_spikes = 0

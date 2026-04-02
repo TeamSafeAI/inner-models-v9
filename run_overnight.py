@@ -28,12 +28,12 @@ sys.path.insert(0, V8)
 
 def run_session(db_path, ticks, tonic, seed):
     """Run one arena session using the V8 engine directly."""
-    from engine.loader import load_brain
+    from engine.loader import load
     from engine.runner import Brain
     from arena import Arena
     from worm_body import WormBody
 
-    data = load_brain(db_path)
+    data = load(db_path)
     n = data['n']
     brain = Brain(data, learn=True)
     body_map = data.get('body_map', {})
