@@ -188,7 +188,11 @@ def grow_regional_axons(neurons, regions, params, rng):
     Growth cones are attracted to regions based on their attractant strength.
     This means thalamus (high attractant) naturally becomes a hub,
     hippocampus attracts from cortex, amygdala attracts from sensory, etc.
+
+    Uses scipy cKDTree for O(log n) contact detection instead of O(n) grid scan.
     """
+    from scipy.spatial import cKDTree
+
     n = neurons['n']
     x, y, z = neurons['x'], neurons['y'], neurons['z']
     cell_types = neurons['cell_types']
@@ -201,77 +205,69 @@ def grow_regional_axons(neurons, regions, params, rng):
     turn_rate = params.get('turn_rate', 0.3)
     contact_radius = params.get('contact_radius', 10.0)
     max_syn_pair = params.get('max_synapses_per_pair', 12)
-    inh_target_exc_prob = params.get('inh_target_exc_prob', 0.78)  # H01: 78% of INH targets are EXC
+    inh_target_exc_prob = params.get('inh_target_exc_prob', 0.78)
 
-    # Build spatial grid
-    grid_size = 50.0  # um
-    grid = {}
-    for i in range(n):
-        key = (int(x[i] / grid_size), int(y[i] / grid_size), int(z[i] / grid_size))
-        grid.setdefault(key, []).append(i)
+    # Build KD-tree for fast spatial queries (O(log n) vs O(n) grid)
+    positions = np.column_stack([x, y, z])
+    tree = cKDTree(positions)
 
-    def get_nearby(px, py, pz, radius):
-        gx, gy, gz = int(px / grid_size), int(py / grid_size), int(pz / grid_size)
-        r = max(1, int(np.ceil(radius / grid_size)))
-        result = []
-        for ddx in range(-r, r + 1):
-            for ddy in range(-r, r + 1):
-                for ddz in range(-r, r + 1):
-                    key = (gx + ddx, gy + ddy, gz + ddz)
-                    if key in grid:
-                        for idx in grid[key]:
-                            d = np.sqrt((x[idx] - px)**2 + (y[idx] - py)**2 + (z[idx] - pz)**2)
-                            if d < radius:
-                                result.append((idx, d))
-        return result
+    # Precompute region center arrays and attractant strengths
+    region_names = list(regions.keys())
+    n_regions = len(region_names)
+    rc_array = np.array([regions[rn]['center'] for rn in region_names], dtype=float)  # (R, 3)
+    ra_array = np.array([regions[rn]['attractant'] for rn in region_names], dtype=float)  # (R,)
+    region_name_to_idx = {rn: i for i, rn in enumerate(region_names)}
 
-    # Region centers for long-range attraction
-    region_centers = {}
-    region_attract = {}
-    for rname, rinfo in regions.items():
-        region_centers[rname] = np.array(rinfo['center'], dtype=float)
-        region_attract[rname] = rinfo['attractant']
+    # EXC lookup as boolean array for fast INH targeting
+    is_exc = np.array([ct == 'EXC' for ct in cell_types])
 
     synapses = []
     pair_counts = {}
 
     start_time = time.perf_counter()
 
+    # Local steering parameters (scale-aware)
+    local_freq = max(20, n // 200)
+    local_radius = min(40.0, 20.0 + 20000.0 / max(n, 1))
+
+    report_interval = max(100, n // 20)
     for src in range(n):
-        if src % 500 == 0 and src > 0:
+        if src % report_interval == 0 and src > 0:
             elapsed = time.perf_counter() - start_time
             rate = src / elapsed
             eta = (n - src) / rate / 60
             print(f"  Growing {src}/{n} ({rate:.0f}/s, {len(synapses)} syn, ETA {eta:.1f}m)")
 
+        src_pos = positions[src]
         src_region = region_labels[src]
+        src_region_idx = region_name_to_idx[src_region]
         is_inh = cell_types[src] == 'INH'
 
-        # Growth direction: influenced by nearby region attractants
+        # Growth direction: biased toward high-attractant regions (NOT own region)
         direction = rng.randn(3)
 
-        # Bias growth toward high-attractant regions (NOT own region)
-        attract_dir = np.zeros(3)
-        for rname, center in region_centers.items():
-            if rname == src_region:
-                continue  # don't attract to own region (those connections are local)
-            to_region = center - np.array([x[src], y[src], z[src]])
-            dist = np.linalg.norm(to_region)
-            if dist > 10:
-                strength = region_attract[rname] / (dist ** 0.5)
-                attract_dir += to_region / dist * strength
+        to_regions = rc_array - src_pos  # (R, 3)
+        dists = np.linalg.norm(to_regions, axis=1)  # (R,)
+        mask = (dists > 10)
+        mask[src_region_idx] = False  # exclude own region
+        if np.any(mask):
+            strengths = ra_array[mask] / np.sqrt(dists[mask])  # (K,)
+            unit_dirs = to_regions[mask] / dists[mask, None]  # (K, 3)
+            attract_dir = np.sum(unit_dirs * strengths[:, None], axis=0)
+            anorm = np.linalg.norm(attract_dir)
+            if anorm > 0.01:
+                attract_dir /= anorm
+                direction = direction * 0.5 + attract_dir * 0.5
 
-        if np.linalg.norm(attract_dir) > 0.01:
-            attract_dir /= np.linalg.norm(attract_dir)
-            direction = direction * 0.5 + attract_dir * 0.5
+        dnorm = np.linalg.norm(direction)
+        if dnorm > 1e-10:
+            direction /= dnorm
 
-        direction /= np.linalg.norm(direction) + 1e-10
-
-        # Start growth
+        # Start growth from soma
         cones = [[
-            x[src] + direction[0] * step_size,
-            y[src] + direction[1] * step_size,
-            z[src] + direction[2] * step_size,
+            src_pos[0] + direction[0] * step_size,
+            src_pos[1] + direction[1] * step_size,
+            src_pos[2] + direction[2] * step_size,
             direction[0], direction[1], direction[2]
         ]]
 
@@ -281,17 +277,16 @@ def grow_regional_axons(neurons, regions, params, rng):
 
             new_cones = []
             for cone in cones:
-                px, py, pz, dx, dy, dz = cone
+                cpx, cpy, cpz, dx, dy, dz = cone
 
-                # Contact check
-                nearby = get_nearby(px, py, pz, contact_radius)
-                for tgt, dist in nearby:
+                # Contact check via KD-tree (O(log n))
+                nearby_idx = tree.query_ball_point([cpx, cpy, cpz], contact_radius)
+                for tgt in nearby_idx:
                     if tgt == src:
                         continue
-                    # INH preferential targeting: 78% chance to connect if EXC, 22% if INH
+                    # INH preferential targeting
                     if is_inh:
-                        tgt_is_exc = cell_types[tgt] == 'EXC'
-                        if tgt_is_exc:
+                        if is_exc[tgt]:
                             if rng.random() > inh_target_exc_prob:
                                 continue
                         else:
@@ -304,32 +299,39 @@ def grow_regional_axons(neurons, regions, params, rng):
                     synapses.append(pair)
                     pair_counts[pair] = count + 1
 
-                # Steering: region centers (fast) + occasional local attraction
-                ax, ay, az = 0.0, 0.0, 0.0
+                # Steering: region centers (vectorized) + occasional local
+                cone_pos = np.array([cpx, cpy, cpz])
+                to_r = rc_array - cone_pos  # (R, 3)
+                d_r = np.linalg.norm(to_r, axis=1)  # (R,)
+                rmask = d_r > 10
+                if np.any(rmask):
+                    weights = ra_array[rmask] / (d_r[rmask] ** 1.5) * 50.0
+                    unit_r = to_r[rmask] / d_r[rmask, None]
+                    accel = np.sum(unit_r * weights[:, None], axis=0)
+                    ax, ay, az = accel[0], accel[1], accel[2]
+                else:
+                    ax, ay, az = 0.0, 0.0, 0.0
 
-                # Steer toward distant region centers (cheap, always)
-                for rname, center in region_centers.items():
-                    to_r = center - np.array([px, py, pz])
-                    d_r = np.linalg.norm(to_r)
-                    if d_r > 10:
-                        w = region_attract[rname] / (d_r ** 1.5) * 50.0
-                        ax += to_r[0] / d_r * w
-                        ay += to_r[1] / d_r * w
-                        az += to_r[2] / d_r * w
+                # Local cell attraction (KD-tree, scale-aware frequency)
+                if step % local_freq == 0:
+                    local_idx = tree.query_ball_point([cpx, cpy, cpz], local_radius)
+                    if local_idx:
+                        local_pos = positions[local_idx]  # (K, 3)
+                        diffs = local_pos - cone_pos  # (K, 3)
+                        local_dists = np.linalg.norm(diffs, axis=1)  # (K,)
+                        valid = (local_dists > 1.0)
+                        # Exclude self
+                        for vi, li in enumerate(local_idx):
+                            if li == src:
+                                valid[vi] = False
+                        if np.any(valid):
+                            w = 1.0 / (local_dists[valid] ** 2)
+                            pull = np.sum(diffs[valid] * w[:, None], axis=0)
+                            ax += pull[0]; ay += pull[1]; az += pull[2]
 
-                # Local cell-level attraction every 5 steps (expensive)
-                if step % 5 == 0:
-                    local = get_nearby(px, py, pz, 40.0)
-                    for tgt, dist in local:
-                        if tgt == src or dist < 1.0:
-                            continue
-                        weight = 1.0 / (dist * dist)
-                        ax += (x[tgt] - px) * weight
-                        ay += (y[tgt] - py) * weight
-                        az += (z[tgt] - pz) * weight
-
-                norm = np.sqrt(ax*ax + ay*ay + az*az)
-                if norm > 1e-10:
+                norm = ax*ax + ay*ay + az*az
+                if norm > 1e-20:
+                    norm = np.sqrt(norm)
                     ax /= norm; ay /= norm; az /= norm
                     dx = dx * (1 - turn_rate) + ax * turn_rate
                     dy = dy * (1 - turn_rate) + ay * turn_rate
@@ -340,13 +342,14 @@ def grow_regional_axons(neurons, regions, params, rng):
                 dy += rng.randn() * 0.15
                 dz += rng.randn() * 0.15
 
-                norm = np.sqrt(dx*dx + dy*dy + dz*dz)
-                if norm > 1e-10:
+                norm = dx*dx + dy*dy + dz*dz
+                if norm > 1e-20:
+                    norm = np.sqrt(norm)
                     dx /= norm; dy /= norm; dz /= norm
 
-                new_px = px + dx * step_size
-                new_py = py + dy * step_size
-                new_pz = pz + dz * step_size
+                new_px = cpx + dx * step_size
+                new_py = cpy + dy * step_size
+                new_pz = cpz + dz * step_size
 
                 new_cones.append([new_px, new_py, new_pz, dx, dy, dz])
 
@@ -355,8 +358,9 @@ def grow_regional_axons(neurons, regions, params, rng):
                     bdx = dx + rng.randn() * 0.5
                     bdy = dy + rng.randn() * 0.5
                     bdz = dz + rng.randn() * 0.5
-                    bnorm = np.sqrt(bdx*bdx + bdy*bdy + bdz*bdz)
-                    if bnorm > 1e-10:
+                    bnorm = bdx*bdx + bdy*bdy + bdz*bdz
+                    if bnorm > 1e-20:
+                        bnorm = np.sqrt(bnorm)
                         bdx /= bnorm; bdy /= bnorm; bdz /= bnorm
                     new_cones.append([new_px, new_py, new_pz, bdx, bdy, bdz])
 
