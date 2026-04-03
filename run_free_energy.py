@@ -118,11 +118,15 @@ def decode_motor(fire_counts, decoders):
     return np.sum(counts * decoders, axis=1)
 
 
-def generate_structured_pattern(channels, tick, pattern_type='sweep'):
+def generate_structured_pattern(channels, tick, pattern_type='sweep',
+                                food_angle=0.0):
     """Generate a structured, predictable sensory pattern.
 
     Near food: the brain receives clean, repeating patterns.
     These create consistent spike timing -> STDP strengthens connections.
+
+    food_angle: angle to food relative to heading (-pi to pi).
+    Used in 'directional' pattern type to encode food direction.
     """
     signal = np.zeros(channels)
     if pattern_type == 'sweep':
@@ -148,6 +152,32 @@ def generate_structured_pattern(channels, tick, pattern_type='sweep'):
             signal[::2] = 0.7
         else:
             signal[1::2] = 0.7
+    elif pattern_type == 'directional':
+        # Directional sweep: sweep direction encodes food direction
+        # food_angle < 0 = food is to the left -> sweep channels 0 -> N
+        # food_angle > 0 = food is to the right -> sweep channels N -> 0
+        # food_angle ~ 0 = food is ahead -> pulse (all channels together)
+        abs_angle = abs(food_angle)
+        if abs_angle < 0.3:
+            # Food ahead: strong pulse
+            period = 15
+            if tick % period < 5:
+                signal[:] = 0.9
+        else:
+            # Directional sweep
+            cycle_len = channels * 4
+            phase = (tick % cycle_len) / cycle_len
+            if food_angle < 0:
+                active_ch = int(phase * channels) % channels
+            else:
+                active_ch = (channels - 1 - int(phase * channels)) % channels
+            # Intensity proportional to angle magnitude
+            intensity = min(0.9, 0.4 + abs_angle * 0.3)
+            signal[active_ch] = intensity
+            if active_ch > 0:
+                signal[active_ch - 1] = intensity * 0.35
+            if active_ch < channels - 1:
+                signal[active_ch + 1] = intensity * 0.35
     return signal
 
 
@@ -161,15 +191,21 @@ def generate_noise_pattern(channels, rng):
 
 
 def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
-                    sensory_gain=6.0, sessions=1, report_interval=5000):
+                    sensory_gain=6.0, sessions=1, report_interval=5000,
+                    structure_mode='steep', explicit_reward=False,
+                    curriculum=False):
     """Run free-energy arena simulation."""
 
     print(f"{'='*70}")
     print(f"  FREE ENERGY ARENA")
     print(f"  Brain: {os.path.basename(db_path)}")
     print(f"  Ticks: {ticks:,d} x {sessions} sessions, tonic: {tonic}, seed: {seed}")
-    print(f"  Reward: NONE (free energy principle)")
+    if explicit_reward:
+        print(f"  Reward: FREE ENERGY + EXPLICIT (hybrid)")
+    else:
+        print(f"  Reward: NONE (free energy principle)")
     print(f"  Near food -> structured patterns, Far -> noise")
+    print(f"  Structure mode: {structure_mode}")
     print(f"{'='*70}")
 
     data = load(db_path)
@@ -195,9 +231,13 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
     for session in range(sessions):
         sess_rng = np.random.RandomState(seed + session * 100)
 
-        # Random start position
+        # Start position
         angle = sess_rng.uniform(0, 2 * np.pi)
-        start_dist = 20.0
+        if curriculum:
+            # Start close, gradually increase: 5 -> 10 -> 15 -> 20 -> 25...
+            start_dist = min(5.0 + session * 5.0, 25.0)
+        else:
+            start_dist = 20.0
         start_x = food_x + start_dist * np.cos(angle)
         start_y = food_y + start_dist * np.sin(angle)
 
@@ -220,6 +260,8 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
         motor_spikes = 0
         structured_ticks = 0
         noise_ticks = 0
+        reward_total = 0.0
+        prev_conc = c0
 
         # Pattern state
         pattern_types = ['sweep', 'pulse', 'alternating']
@@ -238,15 +280,37 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
             dist = np.sqrt((head[0] - food_x)**2 + (head[1] - food_y)**2)
 
             # 2. Free energy encoding
-            # Threshold: above median concentration -> structured, below -> noise
-            # Smooth transition: mix structured and noise proportional to concentration
-            structure_fraction = min(1.0, conc * 3.0)  # 0 = pure noise, 1 = pure structure
+            # structure_fraction: 0 = pure noise, 1 = pure structure
+            if structure_mode == 'flat':
+                # Original: too generous, 75% structured even at dist=20
+                structure_fraction = min(1.0, conc * 3.0)
+            elif structure_mode == 'steep':
+                # Steep: conc^2 * 4. Strong gradient.
+                # d=0: 100%, d=15: 84%, d=20: 25%, d=25: 5%, d=30: 1%
+                structure_fraction = min(1.0, conc ** 2 * 4.0)
+            elif structure_mode == 'binary':
+                # Sharp threshold: structured only when close
+                structure_fraction = 1.0 if conc > 0.4 else 0.0
+            elif structure_mode == 'directional':
+                # Steep gradient + directional encoding in the pattern itself
+                structure_fraction = min(1.0, conc ** 2 * 4.0)
+            else:
+                structure_fraction = min(1.0, conc * 3.0)
+
+            # Compute angle to food relative to heading
+            food_angle = np.arctan2(food_y - head[1], food_x - head[0]) - body.heading
+            # Normalize to [-pi, pi]
+            food_angle = (food_angle + np.pi) % (2 * np.pi) - np.pi
 
             if rng.random() < structure_fraction:
                 # Structured pattern
-                pattern_name = pattern_types[current_pattern % len(pattern_types)]
+                if structure_mode == 'directional':
+                    pattern_name = 'directional'
+                else:
+                    pattern_name = pattern_types[current_pattern % len(pattern_types)]
                 signal = generate_structured_pattern(
-                    electrodes['audio_channels'], tick, pattern_name)
+                    electrodes['audio_channels'], tick, pattern_name,
+                    food_angle=food_angle)
                 structured_ticks += 1
             else:
                 # Noise
@@ -292,6 +356,16 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
             # Also step the worm body physics for natural motion
             body.pos = arena.clamp_to_boundary(body.pos)
 
+            # Optional explicit reward (hybrid mode)
+            if explicit_reward and tick % 200 == 199:
+                new_conc = arena.concentration_at(body.pos[0], body.pos[1])
+                dc = new_conc - prev_conc
+                if abs(dc) > 0.0005:
+                    reward = float(np.clip(dc * 5.0, -1.0, 1.0))
+                    brain.deliver_reward(reward)
+                    reward_total += reward
+                prev_conc = new_conc
+
             # 7. Log
             if tick % 100 == 0:
                 trajectory.append((float(head[0]), float(head[1])))
@@ -325,6 +399,7 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
             'total_spikes': total_spikes,
             'motor_spikes': motor_spikes,
             'struct_pct': float(struct_pct),
+            'reward_total': float(reward_total),
             'elapsed': float(elapsed),
             'ticks_per_sec': float(ticks / elapsed),
         }
@@ -357,9 +432,19 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
     results_dir = os.path.join(BASE, 'results')
     os.makedirs(results_dir, exist_ok=True)
     brain_name = os.path.splitext(os.path.basename(db_path))[0]
-    results_path = os.path.join(results_dir, f"free_energy_{brain_name}_s{seed}.json")
+    results_path = os.path.join(results_dir, f"free_energy_{brain_name}_{structure_mode}_s{seed}.json")
+    summary = {
+        'brain': brain_name,
+        'structure_mode': structure_mode,
+        'explicit_reward': explicit_reward,
+        'tonic': tonic,
+        'seed': seed,
+        'sessions': all_results,
+        'mean_ci': float(np.mean(cis)),
+        'std_ci': float(np.std(cis)),
+    }
     with open(results_path, 'w') as f:
-        json.dump(all_results, f, indent=2)
+        json.dump(summary, f, indent=2)
     print(f"  Results: {results_path}")
 
     return all_results
@@ -373,12 +458,20 @@ def main():
     p.add_argument('--seed', type=int, default=42, help='Random seed')
     p.add_argument('--tonic', type=float, default=2.8, help='Tonic drive')
     p.add_argument('--sensory-gain', type=float, default=6.0, help='Sensory gain')
+    p.add_argument('--structure-mode', default='steep',
+                   choices=['flat', 'steep', 'binary', 'directional'],
+                   help='Structure fraction formula (directional = steep + sweep direction encodes food angle)')
+    p.add_argument('--reward', action='store_true',
+                   help='Add explicit reward on top of free energy (hybrid mode)')
+    p.add_argument('--curriculum', action='store_true',
+                   help='Start close to food, gradually increase distance across sessions')
     args = p.parse_args()
 
     run_free_energy(
         args.brain, ticks=args.ticks, seed=args.seed,
         tonic=args.tonic, sensory_gain=args.sensory_gain,
-        sessions=args.sessions)
+        sessions=args.sessions, structure_mode=args.structure_mode,
+        explicit_reward=args.reward, curriculum=args.curriculum)
 
 
 if __name__ == '__main__':
