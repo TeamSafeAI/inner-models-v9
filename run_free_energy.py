@@ -228,6 +228,11 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
 
     all_results = []
 
+    # Snapshot initial weights for STDP diagnostics
+    w0_plastic = brain.plastic_w_arr.copy() if len(brain.plastic_w_arr) > 0 else np.array([])
+    w0_reward = brain.reward_w_arr.copy() if len(brain.reward_w_arr) > 0 else np.array([])
+    print(f"  STDP tracking: {len(w0_plastic)} plastic, {len(w0_reward)} reward_plastic")
+
     for session in range(sessions):
         sess_rng = np.random.RandomState(seed + session * 100)
 
@@ -261,7 +266,9 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
         structured_ticks = 0
         noise_ticks = 0
         reward_total = 0.0
+        reward_count = 0
         prev_conc = c0
+        prev_dist = d0
 
         # Pattern state
         pattern_types = ['sweep', 'pulse', 'alternating']
@@ -357,14 +364,17 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
             body.pos = arena.clamp_to_boundary(body.pos)
 
             # Optional explicit reward (hybrid mode)
-            if explicit_reward and tick % 200 == 199:
-                new_conc = arena.concentration_at(body.pos[0], body.pos[1])
-                dc = new_conc - prev_conc
-                if abs(dc) > 0.0005:
-                    reward = float(np.clip(dc * 5.0, -1.0, 1.0))
+            # Reward based on distance change to food (more sensitive than concentration)
+            if explicit_reward and tick % 100 == 99:
+                new_dist = np.sqrt((body.pos[0] - food_x)**2 + (body.pos[1] - food_y)**2)
+                dd = prev_dist - new_dist  # positive = getting closer
+                if abs(dd) > 0.001:
+                    # Scale: dd=0.1 (big move toward) -> reward=0.5
+                    reward = float(np.clip(dd * 5.0, -1.0, 1.0))
                     brain.deliver_reward(reward)
                     reward_total += reward
-                prev_conc = new_conc
+                    reward_count += 1
+                prev_dist = new_dist
 
             # 7. Log
             if tick % 100 == 0:
@@ -400,6 +410,7 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
             'motor_spikes': motor_spikes,
             'struct_pct': float(struct_pct),
             'reward_total': float(reward_total),
+            'reward_count': reward_count,
             'elapsed': float(elapsed),
             'ticks_per_sec': float(ticks / elapsed),
         }
@@ -413,6 +424,21 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
         print(f"    Spikes: {total_spikes:,d} total, {motor_spikes:,d} motor")
         print(f"    Synapses alive: {alive_syn} / {len(brain.synapses)}")
         print(f"    Speed: {ticks/elapsed:.0f} ticks/sec")
+
+        # Weight change diagnostics (STDP verification)
+        if len(brain.plastic_w_arr) > 0:
+            dw = brain.plastic_w_arr - w0_plastic
+            n_pot = int(np.sum(dw > 0.01))
+            n_dep = int(np.sum(dw < -0.01))
+            n_unch = int(np.sum(np.abs(dw) <= 0.01))
+            print(f"    STDP: {n_pot} potentiated, {n_dep} depressed, {n_unch} unchanged "
+                  f"(mean dw={np.mean(dw):+.4f}, max={np.max(np.abs(dw)):.4f})")
+        if len(brain.reward_w_arr) > 0:
+            dw_r = brain.reward_w_arr - w0_reward
+            n_pot_r = int(np.sum(dw_r > 0.01))
+            n_dep_r = int(np.sum(dw_r < -0.01))
+            print(f"    Reward STDP: {n_pot_r} potentiated, {n_dep_r} depressed "
+                  f"(mean dw={np.mean(dw_r):+.4f})")
 
         # Between sessions: sleep + structural plasticity
         if session < sessions - 1:

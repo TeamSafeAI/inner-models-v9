@@ -515,7 +515,7 @@ def prune_weak_synapses(synapses, pair_counts, synapse_distances, prune_fraction
 
 
 def save_regional_db(neurons, synapses, pair_counts, params, regions_used, db_path, rng,
-                     synapse_distances=None):
+                     synapse_distances=None, synapse_mode='plastic'):
     """Save grown regional network to V8-compatible SQLite database."""
     v8_path = os.path.join(os.path.dirname(BASE), 'inner-models-v8')
     sys.path.insert(0, v8_path)
@@ -590,19 +590,31 @@ def save_regional_db(neurons, synapses, pair_counts, params, regions_used, db_pa
             dist_scale = np.exp(-form_dist / 200.0)
             weight *= max(0.3, dist_scale)  # floor at 30% to not kill long-range entirely
 
-        # Synapse type assignment:
-        # INH -> fixed (inhibition provides structure, doesn't learn)
-        # EXC multi-contact (3+) -> plastic (validated by growth, just needs STDP)
-        # EXC single/double contact -> developmental (must prove worth or die)
-        # The brain OVERPRODUCES connections, then experience sculpts via FI pruning
+        # Synapse type assignment based on mode:
+        # INH -> always fixed (inhibition provides structure, doesn't learn)
+        # EXC -> depends on synapse_mode:
+        #   'plastic':       all EXC = plastic (full STDP with LTP+LTD)
+        #   'developmental': 1-2 contact = developmental (STDP+pruning), 3+ = plastic
+        #   'reward':        all EXC = reward_plastic (3-factor, needs deliver_reward)
+        #   'mixed':         same-region = plastic (Hebbian), cross-region = reward_plastic (dopamine)
         if not src_exc:
             syn_type = 'fixed'
-        elif n_contacts >= 3:
-            # Multi-contact = strong growth signal, keep as standard plastic
+        elif synapse_mode == 'plastic':
             syn_type = 'plastic'
-        else:
-            # Single/double contact = candidate, must prove useful during critical period
-            syn_type = 'developmental'
+        elif synapse_mode == 'reward':
+            syn_type = 'reward_plastic'
+        elif synapse_mode == 'developmental':
+            if n_contacts >= 3:
+                syn_type = 'plastic'
+            else:
+                syn_type = 'developmental'
+        elif synapse_mode == 'mixed':
+            # Local circuits: Hebbian STDP (learns from activity patterns)
+            # Cross-region projections: reward-gated (learns from dopamine)
+            if src_region == tgt_region:
+                syn_type = 'plastic'
+            else:
+                syn_type = 'reward_plastic'
 
         # Distance-based delay
         d = np.sqrt((neurons['x'][src] - neurons['x'][tgt])**2 +
@@ -702,6 +714,9 @@ def main():
                    help='Metabolic cost per growth step (0=off, 0.003=low, 0.005=med, 0.01=high)')
     p.add_argument('--prune', type=float, default=0.0,
                    help='Post-growth prune fraction (0=off, 0.1=10%%, 0.15=15%%)')
+    p.add_argument('--synapse-mode', default='plastic',
+                   choices=['plastic', 'developmental', 'reward', 'mixed'],
+                   help='EXC synapse type: plastic (STDP), developmental (STDP+pruning), reward (3-factor), mixed (local=plastic, cross=reward)')
     args = p.parse_args()
 
     rng = np.random.RandomState(args.seed)
@@ -786,6 +801,7 @@ def main():
     print(f"  Neurons: {args.neurons}, Steps: {args.steps}")
     print(f"  Contact: {cr:.2f}um {'(auto)' if args.contact_radius is None else ''}, Branch: {args.branch_prob}")
     print(f"  Metabolic: {args.metabolic_cost} {'(off)' if args.metabolic_cost == 0 else ''}, Prune: {args.prune*100:.0f}%")
+    print(f"  Synapse mode: {args.synapse_mode}")
     print(f"  Seed: {args.seed}")
     print(f"  Regions: {', '.join(regions.keys())}")
     print(f"  Birth order: {' -> '.join(rn for rn, _ in sorted(regions.items(), key=lambda x: x[1].get('birth_order', 3)))}")
@@ -819,7 +835,7 @@ def main():
         os.makedirs(db_dir, exist_ok=True)
         db_path = os.path.join(db_dir, f"{name}.db")
         save_regional_db(neurons, synapses, pair_counts, params, regions, db_path, rng,
-                         synapse_distances=synapse_distances)
+                         synapse_distances=synapse_distances, synapse_mode=args.synapse_mode)
 
     print(f"\n{'='*60}")
     print(f"  REGIONAL GROWTH COMPLETE")
