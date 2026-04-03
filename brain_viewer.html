@@ -90,12 +90,12 @@ body { background: #111; color: #ccc; font-family: monospace; overflow: hidden; 
     <div style="margin-bottom:4px">
         <button id="mic-btn" onclick="toggleMic()">Mic OFF</button>
         <div class="level-bar"><div class="level-fill" id="mic-fill" style="width:0%;background:#2a5"></div></div>
-        <span style="color:#555;font-size:10px" id="mic-info">64 freq bands</span>
+        <span style="color:#555;font-size:10px" id="mic-info">16 bands x 8 pop</span>
     </div>
     <div style="margin-bottom:4px">
         <button id="cam-btn" onclick="toggleCam()">Cam OFF</button>
         <div class="level-bar"><div class="level-fill" id="cam-fill" style="width:0%;background:#47a"></div></div>
-        <span style="color:#555;font-size:10px">16x16 px</span>
+        <span style="color:#555;font-size:10px">8x8 px x 4 pop</span>
     </div>
     <canvas id="cam-preview"></canvas>
     <div style="margin-top:6px;color:#666;font-size:10px">
@@ -111,8 +111,8 @@ body { background: #111; color: #ccc; font-family: monospace; overflow: hidden; 
 
 <div id="motor-panel">
     <div style="font-weight:bold;margin-bottom:4px">Motor Output</div>
-    <canvas id="motor-canvas" width="160" height="64"></canvas>
-    <div style="color:#555;font-size:10px;margin-top:2px">32 readout electrodes</div>
+    <canvas id="motor-canvas" width="160" height="40"></canvas>
+    <div style="color:#555;font-size:10px;margin-top:2px">8 decoded channels (128 neurons)</div>
 </div>
 
 <div id="controls">
@@ -194,6 +194,8 @@ function send(obj) {
 }
 
 // --- Microphone ---
+const AUDIO_CHANNELS = 16;  // population encoding channels
+
 async function toggleMic() {
     const btn = document.getElementById('mic-btn');
     if (!micActive) {
@@ -202,7 +204,7 @@ async function toggleMic() {
             micStream = await navigator.mediaDevices.getUserMedia({audio: true});
             const source = audioCtx.createMediaStreamSource(micStream);
             analyser = audioCtx.createAnalyser();
-            analyser.fftSize = 128;  // 64 frequency bins
+            analyser.fftSize = 256;  // 128 frequency bins, downsample to 16 channels
             source.connect(analyser);
             micActive = true;
             btn.textContent = 'Mic ON';
@@ -212,8 +214,7 @@ async function toggleMic() {
         }
     } else {
         micActive = false;
-        // Send zeros to clear residual input
-        send({action: 'audio', fft: new Array(64).fill(0)});
+        send({action: 'audio', fft: new Array(AUDIO_CHANNELS).fill(0)});
         if (micStream) micStream.getTracks().forEach(t => t.stop());
         if (audioCtx) audioCtx.close();
         analyser = null;
@@ -227,10 +228,16 @@ function getAudioFFT() {
     if (!analyser) return null;
     const raw = new Uint8Array(analyser.frequencyBinCount);
     analyser.getByteFrequencyData(raw);
+    // Downsample to AUDIO_CHANNELS by averaging bins into bands
+    const binsPerChannel = Math.floor(raw.length / AUDIO_CHANNELS);
     const fft = [];
     let peak = 0;
-    for (let i = 0; i < raw.length; i++) {
-        const v = raw[i] / 255;
+    for (let ch = 0; ch < AUDIO_CHANNELS; ch++) {
+        let sum = 0;
+        for (let b = 0; b < binsPerChannel; b++) {
+            sum += raw[ch * binsPerChannel + b];
+        }
+        const v = (sum / binsPerChannel) / 255;
         fft.push(v);
         if (v > peak) peak = v;
     }
@@ -239,6 +246,9 @@ function getAudioFFT() {
 }
 
 // --- Camera ---
+const VISUAL_SIZE = 8;  // 8x8 pixel grid
+const VISUAL_CHANNELS = VISUAL_SIZE * VISUAL_SIZE;  // 64
+
 async function toggleCam() {
     const btn = document.getElementById('cam-btn');
     const preview = document.getElementById('cam-preview');
@@ -248,10 +258,9 @@ async function toggleCam() {
             videoEl = document.createElement('video');
             videoEl.srcObject = camStream;
             videoEl.play();
-            // Small canvas for 16x16 downsampling
             camSmall = document.createElement('canvas');
-            camSmall.width = 16;
-            camSmall.height = 16;
+            camSmall.width = VISUAL_SIZE;
+            camSmall.height = VISUAL_SIZE;
             camSmallCtx = camSmall.getContext('2d');
             camActive = true;
             btn.textContent = 'Cam ON';
@@ -262,7 +271,7 @@ async function toggleCam() {
         }
     } else {
         camActive = false;
-        send({action: 'visual', pixels: new Array(256).fill(0)});
+        send({action: 'visual', pixels: new Array(VISUAL_CHANNELS).fill(0)});
         if (camStream) camStream.getTracks().forEach(t => t.stop());
         videoEl = null;
         btn.textContent = 'Cam OFF';
@@ -274,12 +283,11 @@ async function toggleCam() {
 
 function getVisualPixels() {
     if (!camSmallCtx || !videoEl || videoEl.readyState < 2) return null;
-    // Downsample to 16x16
-    camSmallCtx.drawImage(videoEl, 0, 0, 16, 16);
-    const imgData = camSmallCtx.getImageData(0, 0, 16, 16);
+    camSmallCtx.drawImage(videoEl, 0, 0, VISUAL_SIZE, VISUAL_SIZE);
+    const imgData = camSmallCtx.getImageData(0, 0, VISUAL_SIZE, VISUAL_SIZE);
     const pixels = [];
     let total = 0;
-    for (let i = 0; i < 256; i++) {
+    for (let i = 0; i < VISUAL_CHANNELS; i++) {
         const r = imgData.data[i * 4];
         const g = imgData.data[i * 4 + 1];
         const b = imgData.data[i * 4 + 2];
@@ -287,14 +295,12 @@ function getVisualPixels() {
         pixels.push(gray);
         total += gray;
     }
-    // Update preview (larger for visibility)
     const preview = document.getElementById('cam-preview');
     const pCtx = preview.getContext('2d');
     preview.width = 64;
     preview.height = 64;
     pCtx.drawImage(videoEl, 0, 0, 64, 64);
-    // Level bar
-    document.getElementById('cam-fill').style.width = Math.round((total / 256) * 100) + '%';
+    document.getElementById('cam-fill').style.width = Math.round((total / VISUAL_CHANNELS) * 100) + '%';
     return pixels;
 }
 
@@ -540,13 +546,13 @@ function onFrame(data) {
         }
     }
 
-    // Motor output
-    drawMotor(data.motor || []);
+    // Motor output (decoded population values)
+    drawMotor(data.motor_decoded || data.motor || []);
 
     drawEEG();
 }
 
-// --- Motor output: 8x4 heat grid ---
+// --- Motor output: 8 decoded population channels ---
 function drawMotor(motor) {
     const canvas = document.getElementById('motor-canvas');
     const ctx = canvas.getContext('2d');
@@ -555,22 +561,23 @@ function drawMotor(motor) {
     ctx.clearRect(0, 0, w, h);
     if (!motor.length) return;
 
-    const cols = 8;
-    const rows = Math.ceil(motor.length / cols);
-    const cellW = w / cols;
-    const cellH = h / rows;
-    const maxFire = Math.max(1, ...motor);
+    const n = motor.length;
+    const barW = w / n;
+    const maxVal = Math.max(0.01, ...motor);
 
-    for (let i = 0; i < motor.length; i++) {
-        const col = i % cols;
-        const row = Math.floor(i / cols);
-        const val = motor[i] / maxFire;
+    for (let i = 0; i < n; i++) {
+        const val = motor[i] / maxVal;
+        const barH = val * (h - 4);
         // Orange glow for motor activity
         const r = Math.round(30 + val * 225);
         const g = Math.round(20 + val * 150);
         const b = Math.round(10 + val * 30);
         ctx.fillStyle = `rgb(${r},${g},${b})`;
-        ctx.fillRect(col * cellW + 1, row * cellH + 1, cellW - 2, cellH - 2);
+        ctx.fillRect(i * barW + 1, h - barH - 2, barW - 2, barH);
+        // Channel label
+        ctx.fillStyle = '#666';
+        ctx.font = '8px monospace';
+        ctx.fillText(i.toString(), i * barW + barW/2 - 3, 10);
     }
 }
 

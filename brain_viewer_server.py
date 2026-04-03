@@ -30,17 +30,87 @@ NEURON_TYPE_COLORS = {
     'LTS': [0.9, 0.4, 0.8],   # magenta -- low-threshold spiking (inhibitory)
 }
 
-# I/O electrode configuration
-# Arbitrary neuron assignments -- we're just poking with electrodes
+# I/O electrode configuration -- population encoding (Nengo-inspired)
+# Each sensory channel maps to an ENSEMBLE of neurons with different tuning curves.
+# Motor output is a weighted population decode, not single-neuron readout.
 IO = {
-    'audio_n': 64,        # frequency bands (mic FFT bins)
-    'visual_n': 256,      # pixels (16x16 downsampled webcam)
-    'motor_n': 32,        # output readout channels
-    'audio_gain': 5.0,    # mA per unit FFT magnitude
-    'visual_gain': 4.0,   # mA per unit pixel intensity
-    'touch_strength': 15.0,  # mA default touch probe
-    'touch_radius': 40.0,    # spatial units for touch spread
+    # Audio: 16 frequency bands, each encoded by a population of 8 neurons
+    'audio_channels': 16,     # FFT bins (client downsamples to this)
+    'audio_pop_size': 8,      # neurons per frequency band
+    'audio_gain': 6.0,        # mA per unit FFT magnitude
+
+    # Visual: 64 pixels (8x8 grid), each encoded by 4 neurons
+    'visual_channels': 64,    # pixels (8x8 downsampled webcam)
+    'visual_pop_size': 4,     # neurons per pixel
+    'visual_gain': 5.0,       # mA per unit pixel intensity
+
+    # Motor: 8 output channels, each decoded from a population of 16 neurons
+    'motor_channels': 8,      # output dimensions (decoded values)
+    'motor_pop_size': 16,     # neurons per output channel
+
+    # Touch
+    'touch_strength': 15.0,   # mA default touch probe
+    'touch_radius': 40.0,     # spatial units for touch spread
 }
+
+
+def build_population_encoding(n_channels, pop_size, rng):
+    """Build Nengo-style population encoding parameters.
+
+    Each neuron in a channel's ensemble has:
+    - intercept: where in [0, 1] it starts responding (tuning curve shift)
+    - gain: how steeply it responds (tuning curve width)
+
+    Returns: intercepts (channels, pop_size), gains (channels, pop_size)
+    """
+    # Spread intercepts evenly across [0, 1] with jitter
+    intercepts = np.zeros((n_channels, pop_size))
+    gains = np.zeros((n_channels, pop_size))
+    for ch in range(n_channels):
+        # Uniform spread of preferred stimuli + noise
+        intercepts[ch] = np.linspace(0.05, 0.95, pop_size) + rng.randn(pop_size) * 0.05
+        intercepts[ch] = np.clip(intercepts[ch], 0.0, 1.0)
+        # Gains vary so some neurons are sharp responders, some broad
+        gains[ch] = rng.uniform(2.0, 8.0, pop_size)
+    return intercepts, gains
+
+
+def encode_population(signal, intercepts, gains, gain_scale):
+    """Encode signal values into per-neuron current injection.
+
+    signal: (n_channels,) -- values in [0, 1]
+    Returns: (n_channels * pop_size,) -- current injection per neuron
+    """
+    n_channels, pop_size = intercepts.shape
+    # Tuning curve: ReLU(gain * (signal - intercept))
+    # Each neuron fires more when signal exceeds its intercept
+    sig = np.clip(signal, 0, 1)[:, None]  # (channels, 1)
+    activation = np.maximum(0, gains * (sig - intercepts))  # (channels, pop_size)
+    return (activation * gain_scale).ravel()
+
+
+def build_motor_decoders(motor_pop_size, motor_channels, rng):
+    """Build linear decoding weights for motor population readout.
+
+    Returns: (motor_channels, motor_pop_size) weight matrix
+    """
+    # Random initial decoders -- will be refined by observing activity
+    # Positive weights, normalized per channel
+    W = rng.uniform(0.1, 1.0, (motor_channels, motor_pop_size))
+    W /= W.sum(axis=1, keepdims=True)
+    return W
+
+
+def decode_motor(motor_fire_counts, decoders):
+    """Decode motor population firing into output channel values.
+
+    motor_fire_counts: (motor_channels * motor_pop_size,) -- spike counts per neuron
+    decoders: (motor_channels, motor_pop_size) -- decoding weights
+    Returns: (motor_channels,) -- decoded output values
+    """
+    n_channels, pop_size = decoders.shape
+    counts = motor_fire_counts.reshape(n_channels, pop_size)
+    return np.sum(counts * decoders, axis=1)
 
 
 def build_config(brain_data, electrodes):
@@ -103,8 +173,8 @@ def get_frame(brain, neuron_types, tick, fired, motor_fire):
 
 
 async def simulation_loop(websocket, brain, brain_data, neuron_types,
-                          positions, electrodes, args):
-    """Run brain with I/O and stream activity to client."""
+                          positions, electrodes, pop_params, args):
+    """Run brain with population-encoded I/O and stream activity to client."""
     n = brain.n
     speed = args.speed
     ticks_per_frame = max(1, int(33 * speed))
@@ -115,13 +185,21 @@ async def simulation_loop(websocket, brain, brain_data, neuron_types,
     motor_idx = np.array(electrodes['motor'], dtype=np.intp)
     motor_map = {int(idx): i for i, idx in enumerate(motor_idx)}
 
-    # I/O state -- current injection from sensory input
-    audio_data = np.zeros(len(audio_idx))
-    visual_data = np.zeros(len(visual_idx))
+    # Population encoding parameters
+    audio_intercepts = pop_params['audio_intercepts']
+    audio_gains = pop_params['audio_gains']
+    visual_intercepts = pop_params['visual_intercepts']
+    visual_gains = pop_params['visual_gains']
+    motor_decoders = pop_params['motor_decoders']
+
+    # I/O state -- raw channel signals (not per-neuron)
+    audio_signal = np.zeros(IO['audio_channels'])   # 16 frequency bands
+    visual_signal = np.zeros(IO['visual_channels'])  # 64 pixels
     touch_inject = np.zeros(n)
 
     # Send config
     config = build_config(brain_data, electrodes)
+    config['io'] = IO  # send updated IO config to client
     await websocket.send(json.dumps(config))
 
     paused = False
@@ -145,17 +223,17 @@ async def simulation_loop(websocket, brain, brain_data, neuron_types,
                 elif action == 'tonic':
                     args.tonic = cmd.get('value', 2.8)
 
-                # --- Sensory I/O ---
+                # --- Sensory I/O (channel-level, not per-neuron) ---
                 elif action == 'audio':
                     fft = cmd.get('fft', [])
-                    nc = min(len(fft), len(audio_data))
+                    nc = min(len(fft), len(audio_signal))
                     if nc > 0:
-                        audio_data[:nc] = fft[:nc]
+                        audio_signal[:nc] = fft[:nc]
                 elif action == 'visual':
                     px = cmd.get('pixels', [])
-                    nc = min(len(px), len(visual_data))
+                    nc = min(len(px), len(visual_signal))
                     if nc > 0:
-                        visual_data[:nc] = px[:nc]
+                        visual_signal[:nc] = px[:nc]
                 elif action == 'touch':
                     idx = cmd.get('idx', -1)
                     strength = cmd.get('strength', IO['touch_strength'])
@@ -171,10 +249,20 @@ async def simulation_loop(websocket, brain, brain_data, neuron_types,
                 break
 
         if not paused:
-            # Build external current: tonic base + sensory input
+            # Build external current: tonic base + population-encoded sensory input
             I_ext = np.full(n, args.tonic)
-            I_ext[audio_idx] += audio_data * IO['audio_gain']
-            I_ext[visual_idx] += visual_data * IO['visual_gain']
+
+            # Population encoding: channel signals -> per-neuron currents via tuning curves
+            audio_currents = encode_population(
+                audio_signal, audio_intercepts, audio_gains, IO['audio_gain'])
+            visual_currents = encode_population(
+                visual_signal, visual_intercepts, visual_gains, IO['visual_gain'])
+
+            # Inject into electrode neurons
+            n_audio = min(len(audio_currents), len(audio_idx))
+            n_visual = min(len(visual_currents), len(visual_idx))
+            I_ext[audio_idx[:n_audio]] += audio_currents[:n_audio]
+            I_ext[visual_idx[:n_visual]] += visual_currents[:n_visual]
             I_ext += touch_inject
             touch_inject *= 0.7  # touch decays over frames
 
@@ -189,11 +277,15 @@ async def simulation_loop(websocket, brain, brain_data, neuron_types,
                     if fi in motor_map:
                         motor_fire[motor_map[fi]] += 1
 
+            # Population decode: motor neuron firing -> channel values
+            motor_decoded = decode_motor(motor_fire, motor_decoders)
+
             frame = get_frame(brain, neuron_types, brain.tick_count,
                               np.array(list(all_fired)), motor_fire)
             frame['speed'] = speed
             frame['paused'] = False
             frame['tonic'] = float(args.tonic)
+            frame['motor_decoded'] = motor_decoded.tolist()
             await websocket.send(json.dumps(frame))
         else:
             await websocket.send(json.dumps({
@@ -201,6 +293,7 @@ async def simulation_loop(websocket, brain, brain_data, neuron_types,
                 'fired': [], 'n_fired': 0, 'paused': True,
                 'type_fire': {t: 0 for t in NEURON_TYPE_COLORS},
                 'motor': [0] * len(motor_idx),
+                'motor_decoded': [0.0] * IO['motor_channels'],
                 'speed': speed, 'tonic': float(args.tonic),
             }))
 
@@ -211,12 +304,12 @@ async def simulation_loop(websocket, brain, brain_data, neuron_types,
 
 
 async def handler(websocket, brain, brain_data, neuron_types,
-                  positions, electrodes, args):
+                  positions, electrodes, pop_params, args):
     """Handle a single WebSocket connection."""
     print(f"  Client connected")
     try:
         await simulation_loop(websocket, brain, brain_data, neuron_types,
-                              positions, electrodes, args)
+                              positions, electrodes, pop_params, args)
     except Exception as e:
         if 'closed' not in str(e).lower():
             print(f"  Error: {e}")
@@ -254,12 +347,22 @@ async def main():
     positions = np.array([[nn['pos_x'], nn['pos_y'], nn['pos_z']]
                           for nn in brain_data['neurons']])
 
-    # Electrode assignments -- connectivity-based
-    # Input: highest out-degree neurons (they broadcast widest)
-    # Output: highest in-degree neurons (they collect from most sources)
-    audio_n = min(IO['audio_n'], n // 10)
-    visual_n = min(IO['visual_n'], n // 4)
-    motor_n = min(IO['motor_n'], n // 10)
+    # Population-based electrode assignment (Nengo-inspired)
+    # Input ensembles: highest out-degree neurons (they broadcast widest)
+    # Output ensembles: highest in-degree neurons (they collect from most sources)
+    rng = np.random.RandomState(42)  # reproducible electrode assignment
+
+    audio_total = IO['audio_channels'] * IO['audio_pop_size']   # 128
+    visual_total = IO['visual_channels'] * IO['visual_pop_size'] # 256
+    motor_total = IO['motor_channels'] * IO['motor_pop_size']    # 128
+    total_electrodes = audio_total + visual_total + motor_total   # 512
+
+    # Clamp to available neurons
+    if total_electrodes > n // 2:
+        scale = (n // 2) / total_electrodes
+        audio_total = int(audio_total * scale)
+        visual_total = int(visual_total * scale)
+        motor_total = int(motor_total * scale)
 
     in_deg = np.zeros(n, dtype=int)
     out_deg = np.zeros(n, dtype=int)
@@ -269,9 +372,9 @@ async def main():
 
     # Input electrodes: top out-degree neurons
     out_sorted = np.argsort(out_deg)[::-1]
-    input_neurons = out_sorted[:audio_n + visual_n]
-    audio_list = input_neurons[:audio_n].tolist()
-    visual_list = input_neurons[audio_n:audio_n + visual_n].tolist()
+    input_neurons = out_sorted[:audio_total + visual_total]
+    audio_list = input_neurons[:audio_total].tolist()
+    visual_list = input_neurons[audio_total:audio_total + visual_total].tolist()
 
     # Motor electrodes: top in-degree neurons, excluding input
     input_set = set(audio_list + visual_list)
@@ -280,7 +383,7 @@ async def main():
     for idx in in_sorted:
         if int(idx) not in input_set:
             motor_list.append(int(idx))
-        if len(motor_list) >= motor_n:
+        if len(motor_list) >= motor_total:
             break
 
     electrodes = {
@@ -289,13 +392,25 @@ async def main():
         'motor': motor_list,
     }
 
+    # Build population encoding/decoding parameters
+    audio_intercepts, audio_gains = build_population_encoding(
+        IO['audio_channels'], IO['audio_pop_size'], rng)
+    visual_intercepts, visual_gains = build_population_encoding(
+        IO['visual_channels'], IO['visual_pop_size'], rng)
+    motor_decoders = build_motor_decoders(IO['motor_pop_size'], IO['motor_channels'], rng)
+
+    pop_params = {
+        'audio_intercepts': audio_intercepts,
+        'audio_gains': audio_gains,
+        'visual_intercepts': visual_intercepts,
+        'visual_gains': visual_gains,
+        'motor_decoders': motor_decoders,
+    }
+
     # Report electrode stats
-    audio_out = np.mean(out_deg[audio_list])
-    visual_out = np.mean(out_deg[visual_list])
-    motor_in = np.mean(in_deg[motor_list])
-    print(f"  Electrodes: {audio_n} audio (avg out={audio_out:.0f}), "
-          f"{visual_n} visual (avg out={visual_out:.0f}), "
-          f"{motor_n} motor (avg in={motor_in:.0f})")
+    audio_out = np.mean(out_deg[audio_list]) if audio_list else 0
+    visual_out = np.mean(out_deg[visual_list]) if visual_list else 0
+    motor_in = np.mean(in_deg[motor_list]) if motor_list else 0
 
     # Type distribution
     tc = {}
@@ -305,7 +420,10 @@ async def main():
 
     print(f"  Brain: {n}N, {len(brain_data['synapses'])} synapses")
     print(f"  Types: {type_str}")
-    print(f"  Electrodes: {audio_n} audio IN, {visual_n} visual IN, {motor_n} motor OUT")
+    print(f"  Electrodes (population encoded):")
+    print(f"    Audio: {IO['audio_channels']} channels x {IO['audio_pop_size']} neurons = {len(audio_list)} (avg out={audio_out:.0f})")
+    print(f"    Visual: {IO['visual_channels']} channels x {IO['visual_pop_size']} neurons = {len(visual_list)} (avg out={visual_out:.0f})")
+    print(f"    Motor: {IO['motor_channels']} channels x {IO['motor_pop_size']} neurons = {len(motor_list)} (avg in={motor_in:.0f})")
     print(f"  Tonic: {args.tonic}, Speed: {args.speed}x")
     print(f"  Viewer: http://localhost:{args.port - 1}/brain_viewer.html")
 
@@ -333,7 +451,7 @@ async def main():
 
     async with websockets.serve(
         lambda ws: handler(ws, brain, brain_data, neuron_types,
-                           positions, electrodes, args),
+                           positions, electrodes, pop_params, args),
         'localhost', args.port
     ):
         print(f"\n  Ready. Open browser to http://localhost:{http_port}/brain_viewer.html\n")

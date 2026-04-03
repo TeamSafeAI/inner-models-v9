@@ -51,6 +51,7 @@ REGIONS = {
         'neuron_types': {'rs': 0.50, 'fs': 0.25, 'lts': 0.15, 'ib': 0.10},
         'attractant': 1.0,         # moderate -- attracts from thalamus, hippocampus
         'local_density': 1.0,
+        'birth_order': 5,          # late -- last to develop (like real cortex)
         'description': 'Association cortex. Layered. Decision-making.',
     },
     'hippocampus': {
@@ -61,6 +62,7 @@ REGIONS = {
         'neuron_types': {'rs': 0.70, 'fs': 0.15, 'lts': 0.10, 'ch': 0.05},
         'attractant': 1.5,         # strong -- memory hub, attracts from cortex + amygdala
         'local_density': 2.0,      # dense local recurrence (CA3)
+        'birth_order': 3,          # mid -- archicortex develops before neocortex
         'description': 'Memory formation. Dense recurrent. Spatial navigation.',
     },
     'amygdala': {
@@ -71,6 +73,7 @@ REGIONS = {
         'neuron_types': {'rs': 0.40, 'fs': 0.30, 'lts': 0.20, 'ib': 0.10},
         'attractant': 2.0,         # very strong -- fast emotional processing
         'local_density': 1.5,
+        'birth_order': 2,          # early -- emotional circuits develop early
         'description': 'Emotional valence. Fast threat/reward. Outputs to basal ganglia.',
     },
     'basal_ganglia': {
@@ -81,6 +84,7 @@ REGIONS = {
         'neuron_types': {'rs': 0.30, 'fs': 0.40, 'lts': 0.20, 'ib': 0.10},
         'attractant': 0.8,
         'local_density': 1.2,
+        'birth_order': 3,          # mid
         'description': 'Action selection. D1 go / D2 no-go. Inhibitory gating.',
     },
     'thalamus': {
@@ -91,6 +95,7 @@ REGIONS = {
         'neuron_types': {'rs': 0.60, 'fs': 0.20, 'lts': 0.15, 'ch': 0.05},
         'attractant': 1.8,         # strong -- everything passes through thalamus
         'local_density': 0.8,      # less local, more relay
+        'birth_order': 2,          # early -- relay develops before cortex
         'description': 'Sensory relay. Gates information to cortex. Central hub.',
     },
     'brainstem': {
@@ -101,6 +106,7 @@ REGIONS = {
         'neuron_types': {'rs': 0.35, 'fs': 0.20, 'ib': 0.30, 'lts': 0.15},
         'attractant': 0.5,         # low -- receives from above, outputs to body
         'local_density': 1.0,
+        'birth_order': 0,          # FIRST -- brainstem develops earliest
         'description': 'Motor output. CPG. Connects to body_map.',
     },
     'sensory': {
@@ -111,6 +117,7 @@ REGIONS = {
         'neuron_types': {'rs': 0.60, 'fs': 0.25, 'lts': 0.10, 'ib': 0.05},
         'attractant': 0.6,         # moderate -- receives external input
         'local_density': 1.0,
+        'birth_order': 1,          # early -- sensory input develops early
         'description': 'Sensory input. Chemical + mechanical. Connects to sensor_map.',
     },
 }
@@ -183,11 +190,12 @@ def place_regional_neurons(n_total, regions, rng):
 
 
 def grow_regional_axons(neurons, regions, params, rng):
-    """Grow axons with region-aware chemoattraction.
+    """Grow axons with region-aware chemoattraction + metabolic cost.
 
     Growth cones are attracted to regions based on their attractant strength.
-    This means thalamus (high attractant) naturally becomes a hub,
-    hippocampus attracts from cortex, amygdala attracts from sensory, etc.
+    Metabolic cost: longer axons have increasing probability of death per step.
+    Birth-time ordering: neurons grow in developmental order (brainstem first, cortex last).
+    Early-born neurons' existing axons become part of the landscape for later neurons.
 
     Uses scipy cKDTree for O(log n) contact detection instead of O(n) grid scan.
     """
@@ -207,6 +215,13 @@ def grow_regional_axons(neurons, regions, params, rng):
     max_syn_pair = params.get('max_synapses_per_pair', 12)
     inh_target_exc_prob = params.get('inh_target_exc_prob', 0.78)
 
+    # Metabolic cost: constant per-step death probability for growth cones.
+    # Uses half-life model: P(survive N steps) = (1 - cost)^N
+    # cost=0.005 -> half-life ~138 steps, 61% survive 100 steps (gentle local bias)
+    # cost=0.01  -> half-life ~69 steps,  37% survive 100 steps (moderate)
+    # cost=0.02  -> half-life ~34 steps,  13% survive 100 steps (strong local bias)
+    metabolic_cost = params.get('metabolic_cost', 0.0)  # 0 = off (legacy behavior)
+
     # Build KD-tree for fast spatial queries (O(log n) vs O(n) grid)
     positions = np.column_stack([x, y, z])
     tree = cKDTree(positions)
@@ -221,8 +236,23 @@ def grow_regional_axons(neurons, regions, params, rng):
     # EXC lookup as boolean array for fast INH targeting
     is_exc = np.array([ct == 'EXC' for ct in cell_types])
 
+    # Birth-time ordering: sort neurons by region birth_order
+    # Within each birth wave, neurons grow in random order
+    birth_orders = np.array([regions[region_labels[i]].get('birth_order', 3)
+                             for i in range(n)])
+    # Stable sort by birth_order preserves original within-group ordering
+    # Then shuffle within each birth wave for randomness
+    growth_order = np.argsort(birth_orders, kind='stable')
+    # Shuffle within birth waves
+    unique_waves = np.unique(birth_orders)
+    for wave in unique_waves:
+        wave_mask = birth_orders[growth_order] == wave
+        wave_indices = np.where(wave_mask)[0]
+        rng.shuffle(growth_order[wave_indices[0]:wave_indices[-1]+1])
+
     synapses = []
     pair_counts = {}
+    synapse_distances = {}  # track formation distance for weight scaling
 
     start_time = time.perf_counter()
 
@@ -231,12 +261,17 @@ def grow_regional_axons(neurons, regions, params, rng):
     local_radius = min(40.0, 20.0 + 20000.0 / max(n, 1))
 
     report_interval = max(100, n // 20)
-    for src in range(n):
-        if src % report_interval == 0 and src > 0:
+    cones_killed = 0
+    cones_total = 0
+
+    for grow_idx, src in enumerate(growth_order):
+        if grow_idx % report_interval == 0 and grow_idx > 0:
             elapsed = time.perf_counter() - start_time
-            rate = src / elapsed
-            eta = (n - src) / rate / 60
-            print(f"  Growing {src}/{n} ({rate:.0f}/s, {len(synapses)} syn, ETA {eta:.1f}m)")
+            rate = grow_idx / elapsed
+            eta = (n - grow_idx) / rate / 60
+            killed_pct = cones_killed / max(cones_total, 1) * 100
+            print(f"  Growing {grow_idx}/{n} ({rate:.0f}/s, {len(synapses)} syn, "
+                  f"ETA {eta:.1f}m, {killed_pct:.0f}% cones died)")
 
         src_pos = positions[src]
         src_region = region_labels[src]
@@ -264,11 +299,13 @@ def grow_regional_axons(neurons, regions, params, rng):
             direction /= dnorm
 
         # Start growth from soma
+        # Cone format: [px, py, pz, dx, dy, dz, distance_traveled]
         cones = [[
             src_pos[0] + direction[0] * step_size,
             src_pos[1] + direction[1] * step_size,
             src_pos[2] + direction[2] * step_size,
-            direction[0], direction[1], direction[2]
+            direction[0], direction[1], direction[2],
+            step_size  # initial distance
         ]]
 
         for step in range(steps):
@@ -277,7 +314,14 @@ def grow_regional_axons(neurons, regions, params, rng):
 
             new_cones = []
             for cone in cones:
-                cpx, cpy, cpz, dx, dy, dz = cone
+                cpx, cpy, cpz, dx, dy, dz, dist_traveled = cone
+                cones_total += 1
+
+                # Metabolic cost: constant per-step death (half-life model)
+                if metabolic_cost > 0:
+                    if rng.random() < metabolic_cost:
+                        cones_killed += 1
+                        continue  # cone dies, no more growth from this tip
 
                 # Contact check via KD-tree (O(log n))
                 nearby_idx = tree.query_ball_point([cpx, cpy, cpz], contact_radius)
@@ -298,6 +342,9 @@ def grow_regional_axons(neurons, regions, params, rng):
                         continue
                     synapses.append(pair)
                     pair_counts[pair] = count + 1
+                    # Record formation distance (for weight scaling)
+                    if pair not in synapse_distances:
+                        synapse_distances[pair] = dist_traveled
 
                 # Steering: region centers (vectorized) + occasional local
                 cone_pos = np.array([cpx, cpy, cpz])
@@ -350,11 +397,16 @@ def grow_regional_axons(neurons, regions, params, rng):
                 new_px = cpx + dx * step_size
                 new_py = cpy + dy * step_size
                 new_pz = cpz + dz * step_size
+                new_dist = dist_traveled + step_size
 
-                new_cones.append([new_px, new_py, new_pz, dx, dy, dz])
+                new_cones.append([new_px, new_py, new_pz, dx, dy, dz, new_dist])
 
-                # Branch
-                if len(new_cones) < max_branches and rng.random() < branch_prob:
+                # Branch (metabolic cost reduces branching for distant cones)
+                effective_branch_prob = branch_prob
+                if metabolic_cost > 0 and dist_traveled > step_size * 30:
+                    # Only reduce branching after 30 steps (150um) -- local branching stays full
+                    effective_branch_prob *= 0.5
+                if len(new_cones) < max_branches and rng.random() < effective_branch_prob:
                     bdx = dx + rng.randn() * 0.5
                     bdy = dy + rng.randn() * 0.5
                     bdz = dz + rng.randn() * 0.5
@@ -362,14 +414,19 @@ def grow_regional_axons(neurons, regions, params, rng):
                     if bnorm > 1e-20:
                         bnorm = np.sqrt(bnorm)
                         bdx /= bnorm; bdy /= bnorm; bdz /= bnorm
-                    new_cones.append([new_px, new_py, new_pz, bdx, bdy, bdz])
+                    new_cones.append([new_px, new_py, new_pz, bdx, bdy, bdz, new_dist])
 
             cones = new_cones
 
     elapsed = time.perf_counter() - start_time
-    print(f"  Growth complete: {len(synapses)} synapses in {elapsed:.1f}s")
+    if metabolic_cost > 0:
+        killed_pct = cones_killed / max(cones_total, 1) * 100
+        print(f"  Growth complete: {len(synapses)} synapses in {elapsed:.1f}s "
+              f"(metabolic cost={metabolic_cost}, {killed_pct:.0f}% cones died)")
+    else:
+        print(f"  Growth complete: {len(synapses)} synapses in {elapsed:.1f}s")
 
-    return synapses, pair_counts
+    return synapses, pair_counts, synapse_distances
 
 
 def analyze_regional(neurons, synapses, regions):
@@ -426,7 +483,39 @@ def analyze_regional(neurons, synapses, regions):
               f"ratio={in_per/max(out_per,0.01):.2f}")
 
 
-def save_regional_db(neurons, synapses, pair_counts, params, regions_used, db_path, rng):
+def prune_weak_synapses(synapses, pair_counts, synapse_distances, prune_fraction, rng):
+    """Drop the weakest synapses post-growth. Sharpens regional structure.
+
+    Weakness = long formation distance + few contacts. Multi-contact pairs
+    survive even at long range (they represent strong biological connections).
+    """
+    if prune_fraction <= 0:
+        return synapses, pair_counts, synapse_distances
+
+    # Score each unique pair: lower = weaker = more likely to be pruned
+    pair_scores = {}
+    for pair, count in pair_counts.items():
+        dist = synapse_distances.get(pair, 100.0)
+        # Score: more contacts = stronger, shorter distance = stronger
+        pair_scores[pair] = count / (1.0 + dist * 0.01)
+
+    # Sort by score, prune the bottom fraction
+    sorted_pairs = sorted(pair_scores.items(), key=lambda x: x[1])
+    n_prune = int(len(sorted_pairs) * prune_fraction)
+    pruned_set = set(pair for pair, _ in sorted_pairs[:n_prune])
+
+    new_synapses = [s for s in synapses if (s[0], s[1]) not in pruned_set]
+    new_pair_counts = {p: c for p, c in pair_counts.items() if p not in pruned_set}
+    new_distances = {p: d for p, d in synapse_distances.items() if p not in pruned_set}
+
+    print(f"  Pruned {n_prune} weak pairs ({prune_fraction*100:.0f}%), "
+          f"{len(new_pair_counts)} pairs remain ({len(new_synapses)} synapses)")
+
+    return new_synapses, new_pair_counts, new_distances
+
+
+def save_regional_db(neurons, synapses, pair_counts, params, regions_used, db_path, rng,
+                     synapse_distances=None):
     """Save grown regional network to V8-compatible SQLite database."""
     v8_path = os.path.join(os.path.dirname(BASE), 'inner-models-v8')
     sys.path.insert(0, v8_path)
@@ -487,11 +576,19 @@ def save_regional_db(neurons, synapses, pair_counts, params, regions_used, db_pa
         tgt_region = region_labels[tgt]
 
         # Weight: base scaled by contacts, sign from neuron type
+        # Distance penalty: longer formation distance = weaker initial weight
         if src_exc:
             base_w = 2.0
         else:
             base_w = -2.5  # inhibitory -> negative weight
         weight = base_w * (1.0 + 0.3 * (n_contacts - 1))
+        # Apply distance-based attenuation if we have formation distances
+        if synapse_distances and (src, tgt) in synapse_distances:
+            form_dist = synapse_distances[(src, tgt)]
+            # Exponential decay: local synapses full strength, distant ones weaker
+            # Half-life ~200um (40 steps * 5um/step)
+            dist_scale = np.exp(-form_dist / 200.0)
+            weight *= max(0.3, dist_scale)  # floor at 30% to not kill long-range entirely
 
         # Synapse type: INH = fixed (inhibition isn't reward-modulated)
         # EXC cross-region = reward_plastic, EXC local = plastic
@@ -583,6 +680,10 @@ def main():
     p.add_argument('--no-save', action='store_true')
     p.add_argument('--config', default=None,
                    help='Region config preset: balanced, cortex_heavy, memory_dense, thalamic_hub, spread')
+    p.add_argument('--metabolic-cost', type=float, default=0.0,
+                   help='Metabolic cost per growth step (0=off, 0.003=low, 0.005=med, 0.01=high)')
+    p.add_argument('--prune', type=float, default=0.0,
+                   help='Post-growth prune fraction (0=off, 0.1=10%%, 0.15=15%%)')
     args = p.parse_args()
 
     rng = np.random.RandomState(args.seed)
@@ -657,6 +758,7 @@ def main():
         'max_synapses_per_pair': 12,
         'inh_target_exc_prob': 0.78,
         'param_jitter': 0.15,
+        'metabolic_cost': args.metabolic_cost,
     }
 
     config_label = args.config or 'balanced'
@@ -665,8 +767,10 @@ def main():
     print(f"  Config: {config_label}")
     print(f"  Neurons: {args.neurons}, Steps: {args.steps}")
     print(f"  Contact: {cr:.2f}um {'(auto)' if args.contact_radius is None else ''}, Branch: {args.branch_prob}")
+    print(f"  Metabolic: {args.metabolic_cost} {'(off)' if args.metabolic_cost == 0 else ''}, Prune: {args.prune*100:.0f}%")
     print(f"  Seed: {args.seed}")
     print(f"  Regions: {', '.join(regions.keys())}")
+    print(f"  Birth order: {' -> '.join(rn for rn, _ in sorted(regions.items(), key=lambda x: x[1].get('birth_order', 3)))}")
     print(f"{'='*60}")
 
     # 1. Place neurons
@@ -675,7 +779,13 @@ def main():
 
     # 2. Grow axons
     print(f"\n  Growing axons (this takes a while)...")
-    synapses, pair_counts = grow_regional_axons(neurons, regions, params, rng)
+    synapses, pair_counts, synapse_distances = grow_regional_axons(neurons, regions, params, rng)
+
+    # 2.5. Post-growth pruning (drop weak long-range, low-contact pairs)
+    if args.prune > 0:
+        print(f"\n  Pruning weakest {args.prune*100:.0f}% of connections...")
+        synapses, pair_counts, synapse_distances = prune_weak_synapses(
+            synapses, pair_counts, synapse_distances, args.prune, rng)
 
     # 3. Analyze
     analyze_regional(neurons, synapses, regions)
@@ -690,7 +800,8 @@ def main():
         db_dir = os.path.join(BASE, 'brains')
         os.makedirs(db_dir, exist_ok=True)
         db_path = os.path.join(db_dir, f"{name}.db")
-        save_regional_db(neurons, synapses, pair_counts, params, regions, db_path, rng)
+        save_regional_db(neurons, synapses, pair_counts, params, regions, db_path, rng,
+                         synapse_distances=synapse_distances)
 
     print(f"\n{'='*60}")
     print(f"  REGIONAL GROWTH COMPLETE")
