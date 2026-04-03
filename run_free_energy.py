@@ -193,7 +193,9 @@ def generate_noise_pattern(channels, rng):
 def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
                     sensory_gain=6.0, sessions=1, report_interval=5000,
                     structure_mode='steep', explicit_reward=False,
-                    curriculum=False, balanced_stdp=False):
+                    curriculum=False, balanced_stdp=False,
+                    structural_plasticity=False,
+                    motor_feedback=False):
     """Run free-energy arena simulation."""
 
     print(f"{'='*70}")
@@ -206,6 +208,8 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
         print(f"  Reward: NONE (free energy principle)")
     print(f"  Near food -> structured patterns, Far -> noise")
     print(f"  Structure mode: {structure_mode}")
+    if motor_feedback:
+        print(f"  MOTOR FEEDBACK: structured/noise injected into motor neurons (DishBrain-style)")
     print(f"{'='*70}")
 
     data = load(db_path)
@@ -226,6 +230,18 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
             inh_r = brain.reward_is_inh
             brain.reward_wmin_arr[inh_r] = np.minimum(brain.reward_w_arr[inh_r] * 2.0, -0.1)
         print(f"  BALANCED STDP: w_max = 2x current weight")
+
+    # Structural plasticity: extend critical period + enable in-loop sprouting
+    if structural_plasticity:
+        # Extend developmental critical period to cover full experiment
+        total_ticks = ticks * sessions
+        if hasattr(brain, 'dev_critical_period'):
+            brain.dev_critical_period = total_ticks + 10000
+            brain.dev_critical_done = False
+            brain.dev_eval_interval = 5000
+            print(f"  STRUCTURAL: critical period extended to {total_ticks + 10000} ticks")
+        # Track structural changes
+        structural_log = {'pruned': 0, 'sprouted': 0, 'initial_synapses': len(data['synapses'])}
 
     print(f"  Brain: {n}N, {len(data['synapses'])} synapses")
 
@@ -287,6 +303,7 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
         # Pattern state
         pattern_types = ['sweep', 'pulse', 'alternating']
         current_pattern = 0
+        prev_turn = 0.0  # For direct feedback mode
 
         start_time = time.perf_counter()
 
@@ -302,12 +319,16 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
 
             # 2. Free energy encoding
             # structure_fraction: 0 = pure noise, 1 = pure structure
+            # Compute angle to food relative to heading
+            food_angle = np.arctan2(food_y - head[1], food_x - head[0]) - body.heading
+            # Normalize to [-pi, pi]
+            food_angle = (food_angle + np.pi) % (2 * np.pi) - np.pi
+
             if structure_mode == 'flat':
                 # Original: too generous, 75% structured even at dist=20
                 structure_fraction = min(1.0, conc * 3.0)
             elif structure_mode == 'steep':
                 # Steep: conc^2 * 4. Strong gradient.
-                # d=0: 100%, d=15: 84%, d=20: 25%, d=25: 5%, d=30: 1%
                 structure_fraction = min(1.0, conc ** 2 * 4.0)
             elif structure_mode == 'binary':
                 # Sharp threshold: structured only when close
@@ -315,17 +336,27 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
             elif structure_mode == 'directional':
                 # Steep gradient + directional encoding in the pattern itself
                 structure_fraction = min(1.0, conc ** 2 * 4.0)
+            elif structure_mode == 'direct':
+                # DIRECT FEEDBACK: motor alignment with food determines input
+                # DishBrain-faithful: previous motor action -> current sensory consequence
+                # Turn toward food = structured, turn away = noise
+                # This removes the ~1000 tick physics delay
+                motor_alignment = prev_turn * np.sign(food_angle)
+                # positive alignment = turning toward food
+                if tick < 100:
+                    structure_fraction = 0.5  # warm-up
+                elif motor_alignment > 0.01:
+                    structure_fraction = 1.0  # good turn -> full structure
+                elif motor_alignment < -0.01:
+                    structure_fraction = 0.0  # bad turn -> full noise
+                else:
+                    structure_fraction = 0.5  # no turn -> mixed
             else:
                 structure_fraction = min(1.0, conc * 3.0)
 
-            # Compute angle to food relative to heading
-            food_angle = np.arctan2(food_y - head[1], food_x - head[0]) - body.heading
-            # Normalize to [-pi, pi]
-            food_angle = (food_angle + np.pi) % (2 * np.pi) - np.pi
-
             if rng.random() < structure_fraction:
                 # Structured pattern
-                if structure_mode == 'directional':
+                if structure_mode in ('directional', 'direct'):
                     pattern_name = 'directional'
                 else:
                     pattern_name = pattern_types[current_pattern % len(pattern_types)]
@@ -349,6 +380,20 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
             n_inject = min(len(currents), len(audio_idx))
             I_ext[audio_idx[:n_inject]] += currents[:n_inject]
 
+            # 3b. Motor neuron feedback (DishBrain-style)
+            # Inject structured/noise into MOTOR neurons based on previous turn correctness
+            # This lets STDP on hidden->motor pathways learn output mappings
+            if motor_feedback and tick > 0:
+                motor_alignment = prev_turn * np.sign(food_angle)
+                if motor_alignment > 0.01:
+                    # Correct turn: structured pulse on motor neurons (consistent timing)
+                    motor_period = 20
+                    if tick % motor_period < 5:
+                        I_ext[motor_idx] += sensory_gain * 0.5
+                elif motor_alignment < -0.01:
+                    # Wrong turn: noise on motor neurons (inconsistent timing)
+                    I_ext[motor_idx] += rng.uniform(0, sensory_gain * 0.5, len(motor_idx))
+
             # 4. Tick brain (STDP active, NO explicit reward)
             fired = brain.tick(external_I=I_ext)
             n_fired = len(fired)
@@ -367,6 +412,9 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
             # Map 4 channels to: forward, backward, turn_left, turn_right
             fwd = max(0, motor_decoded[0] - motor_decoded[1])
             turn = motor_decoded[2] - motor_decoded[3]
+
+            # Save turn for direct feedback mode (used next tick)
+            prev_turn = turn
 
             # Apply movement (simple steering model)
             speed = fwd * 0.003  # Scale to arena units
@@ -390,7 +438,18 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
                     reward_count += 1
                 prev_dist = new_dist
 
-            # 7. Log
+            # 7. In-loop structural plasticity: sprout new connections periodically
+            if structural_plasticity and tick > 0 and tick % 10000 == 0:
+                sprout_result = brain.sprout(max_new=30, window=10000, min_cofire=5,
+                                             weight=0.5, max_distance=100.0)
+                n_sprouted = sprout_result.get('sprouted', 0)
+                if n_sprouted > 0:
+                    structural_log['sprouted'] += n_sprouted
+                    print(f"  [sprout] +{n_sprouted} new synapses "
+                          f"(from {sprout_result['candidates']} candidates, "
+                          f"top cofire={sprout_result.get('top_cofire', 0)})")
+
+            # 8. Log
             if tick % 100 == 0:
                 trajectory.append((float(head[0]), float(head[1])))
                 conc_log.append(float(conc))
@@ -400,8 +459,15 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
                 struct_pct = structured_ticks / max(structured_ticks + noise_ticks, 1) * 100
                 elapsed = time.perf_counter() - start_time
                 rate = tick / elapsed
+                # Count alive synapses for structural plasticity reporting
+                if structural_plasticity and hasattr(brain, 'dev_alive') and len(brain.dev_alive) > 0:
+                    alive_dev = int(brain.dev_alive.sum())
+                    total_dev = len(brain.dev_alive)
+                    syn_info = f" dev={alive_dev}/{total_dev}"
+                else:
+                    syn_info = ""
                 print(f"  {tick:>8d} | {conc:.4f} | {dist:>5.1f} | {struct_pct:>5.1f}% | "
-                      f"{motor_spikes:>6d} | {total_spikes:>6d} | {pattern_types[current_pattern % len(pattern_types)]}")
+                      f"{motor_spikes:>6d} | {total_spikes:>6d} | {pattern_types[current_pattern % len(pattern_types)]}{syn_info}")
 
         # Session summary
         elapsed = time.perf_counter() - start_time
@@ -438,6 +504,12 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
         print(f"    Spikes: {total_spikes:,d} total, {motor_spikes:,d} motor")
         print(f"    Synapses alive: {alive_syn} / {len(brain.synapses)}")
         print(f"    Speed: {ticks/elapsed:.0f} ticks/sec")
+        if structural_plasticity:
+            if hasattr(brain, 'dev_alive') and len(brain.dev_alive) > 0:
+                alive_dev = int(brain.dev_alive.sum())
+                total_dev = len(brain.dev_alive)
+                print(f"    Developmental: {alive_dev}/{total_dev} alive ({alive_dev/total_dev*100:.0f}%)")
+            print(f"    Structural changes: +{structural_log['sprouted']} sprouted")
 
         # Weight change diagnostics (STDP verification)
         if len(brain.plastic_w_arr) > 0:
@@ -515,14 +587,18 @@ def main():
     p.add_argument('--tonic', type=float, default=2.8, help='Tonic drive')
     p.add_argument('--sensory-gain', type=float, default=6.0, help='Sensory gain')
     p.add_argument('--structure-mode', default='steep',
-                   choices=['flat', 'steep', 'binary', 'directional'],
-                   help='Structure fraction formula (directional = steep + sweep direction encodes food angle)')
+                   choices=['flat', 'steep', 'binary', 'directional', 'direct'],
+                   help='Structure fraction formula (direct = motor alignment with food determines input)')
     p.add_argument('--reward', action='store_true',
                    help='Add explicit reward on top of free energy (hybrid mode)')
     p.add_argument('--curriculum', action='store_true',
                    help='Start close to food, gradually increase distance across sessions')
     p.add_argument('--balanced', action='store_true',
                    help='Narrow w_max to 2x weight for balanced LTP/LTD')
+    p.add_argument('--structural', action='store_true',
+                   help='Enable in-loop structural plasticity (sprouting + extended dev pruning)')
+    p.add_argument('--motor-feedback', action='store_true',
+                   help='DishBrain-style: inject structured/noise into motor neurons based on turn correctness')
     args = p.parse_args()
 
     run_free_energy(
@@ -530,7 +606,9 @@ def main():
         tonic=args.tonic, sensory_gain=args.sensory_gain,
         sessions=args.sessions, structure_mode=args.structure_mode,
         explicit_reward=args.reward, curriculum=args.curriculum,
-        balanced_stdp=args.balanced)
+        balanced_stdp=args.balanced,
+        structural_plasticity=args.structural,
+        motor_feedback=args.motor_feedback)
 
 
 if __name__ == '__main__':
