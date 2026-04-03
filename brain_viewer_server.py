@@ -254,15 +254,48 @@ async def main():
     positions = np.array([[nn['pos_x'], nn['pos_y'], nn['pos_z']]
                           for nn in brain_data['neurons']])
 
-    # Electrode assignments -- arbitrary index ranges, pure electrode probing
+    # Electrode assignments -- connectivity-based
+    # Input: highest out-degree neurons (they broadcast widest)
+    # Output: highest in-degree neurons (they collect from most sources)
     audio_n = min(IO['audio_n'], n // 10)
     visual_n = min(IO['visual_n'], n // 4)
     motor_n = min(IO['motor_n'], n // 10)
+
+    in_deg = np.zeros(n, dtype=int)
+    out_deg = np.zeros(n, dtype=int)
+    for s in brain_data['synapses']:
+        out_deg[s['source']] += 1
+        in_deg[s['target']] += 1
+
+    # Input electrodes: top out-degree neurons
+    out_sorted = np.argsort(out_deg)[::-1]
+    input_neurons = out_sorted[:audio_n + visual_n]
+    audio_list = input_neurons[:audio_n].tolist()
+    visual_list = input_neurons[audio_n:audio_n + visual_n].tolist()
+
+    # Motor electrodes: top in-degree neurons, excluding input
+    input_set = set(audio_list + visual_list)
+    in_sorted = np.argsort(in_deg)[::-1]
+    motor_list = []
+    for idx in in_sorted:
+        if int(idx) not in input_set:
+            motor_list.append(int(idx))
+        if len(motor_list) >= motor_n:
+            break
+
     electrodes = {
-        'audio': list(range(0, audio_n)),
-        'visual': list(range(audio_n, audio_n + visual_n)),
-        'motor': list(range(n - motor_n, n)),
+        'audio': audio_list,
+        'visual': visual_list,
+        'motor': motor_list,
     }
+
+    # Report electrode stats
+    audio_out = np.mean(out_deg[audio_list])
+    visual_out = np.mean(out_deg[visual_list])
+    motor_in = np.mean(in_deg[motor_list])
+    print(f"  Electrodes: {audio_n} audio (avg out={audio_out:.0f}), "
+          f"{visual_n} visual (avg out={visual_out:.0f}), "
+          f"{motor_n} motor (avg in={motor_in:.0f})")
 
     # Type distribution
     tc = {}
