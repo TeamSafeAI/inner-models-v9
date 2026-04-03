@@ -1,2 +1,4 @@
 __pycache__/
 *.running
+brains/*.db
+results/
