@@ -409,13 +409,29 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
         print(f"    CI: {ci:+.3f}")
         print(f"    Distance: {d0:.1f} -> {final_dist:.1f} (min: {min_dist:.1f})")
         print(f"    Structured input: {struct_pct:.0f}% of ticks")
+        alive_syn = sum(1 for s in brain.synapses if s.get('alive', True) and s.get('weight', 0) != 0)
         print(f"    Spikes: {total_spikes:,d} total, {motor_spikes:,d} motor")
+        print(f"    Synapses alive: {alive_syn} / {len(brain.synapses)}")
         print(f"    Speed: {ticks/elapsed:.0f} ticks/sec")
 
-        # Sleep between sessions (homeostasis)
-        if session < sessions - 1 and hasattr(brain, 'sleep'):
-            print(f"\n  Sleeping between sessions...")
-            brain.sleep(5000, compression=0.8)
+        # Between sessions: sleep + structural plasticity
+        if session < sessions - 1:
+            # 1. Sprouting: grow new connections between co-active neurons
+            if hasattr(brain, 'sprout'):
+                sprout_result = brain.sprout(max_new=50, window=ticks, min_cofire=3,
+                                             weight=0.5, max_distance=100.0)
+                if sprout_result.get('sprouted', 0) > 0:
+                    print(f"\n  Sprouted {sprout_result['sprouted']} new synapses "
+                          f"(from {sprout_result['candidates']} candidates)")
+
+            # 2. Sleep: consolidate + homeostasis
+            if hasattr(brain, 'sleep'):
+                print(f"  Sleeping between sessions...")
+                brain.sleep(5000, compression=0.8)
+
+            # Report synapse count (may change from sprouting + developmental pruning)
+            alive_syn = sum(1 for s in brain.synapses if s.get('alive', True) and s.get('weight', 0) != 0)
+            print(f"  Synapses alive: {alive_syn} / {len(brain.synapses)}")
 
     # Overall summary
     print(f"\n{'='*70}")

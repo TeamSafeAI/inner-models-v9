@@ -590,14 +590,19 @@ def save_regional_db(neurons, synapses, pair_counts, params, regions_used, db_pa
             dist_scale = np.exp(-form_dist / 200.0)
             weight *= max(0.3, dist_scale)  # floor at 30% to not kill long-range entirely
 
-        # Synapse type: INH = fixed (inhibition isn't reward-modulated)
-        # EXC cross-region = reward_plastic, EXC local = plastic
+        # Synapse type assignment:
+        # INH -> fixed (inhibition provides structure, doesn't learn)
+        # EXC multi-contact (3+) -> plastic (validated by growth, just needs STDP)
+        # EXC single/double contact -> developmental (must prove worth or die)
+        # The brain OVERPRODUCES connections, then experience sculpts via FI pruning
         if not src_exc:
             syn_type = 'fixed'
-        elif src_region != tgt_region:
-            syn_type = 'reward_plastic'
-        else:
+        elif n_contacts >= 3:
+            # Multi-contact = strong growth signal, keep as standard plastic
             syn_type = 'plastic'
+        else:
+            # Single/double contact = candidate, must prove useful during critical period
+            syn_type = 'developmental'
 
         # Distance-based delay
         d = np.sqrt((neurons['x'][src] - neurons['x'][tgt])**2 +
@@ -607,13 +612,18 @@ def save_regional_db(neurons, synapses, pair_counts, params, regions_used, db_pa
 
         params_dict = {'n_contacts': n_contacts, 'src_region': src_region, 'tgt_region': tgt_region}
         # Set w_min/w_max for plastic types based on sign
-        if syn_type in ('plastic', 'reward_plastic'):
+        if syn_type in ('plastic', 'reward_plastic', 'developmental'):
             if weight < 0:
                 params_dict['w_min'] = -10.0
                 params_dict['w_max'] = 0.0
             else:
                 params_dict['w_min'] = 0.0
                 params_dict['w_max'] = 10.0
+        # Developmental: longer critical period for complex brains
+        if syn_type == 'developmental':
+            params_dict['critical_period'] = 30000   # 30K ticks to prove worth
+            params_dict['pruning_threshold'] = 0.01  # lenient -- even weak correlation keeps you alive
+            params_dict['eval_interval'] = 5000      # evaluate every 5K ticks
         params_json = json.dumps(params_dict)
 
         conn.execute(
@@ -629,12 +639,20 @@ def save_regional_db(neurons, synapses, pair_counts, params, regions_used, db_pa
     n_reward = conn.execute("SELECT COUNT(*) FROM synapses WHERE synapse_type='reward_plastic'").fetchone()[0]
     n_plastic = conn.execute("SELECT COUNT(*) FROM synapses WHERE synapse_type='plastic'").fetchone()[0]
     n_fixed = conn.execute("SELECT COUNT(*) FROM synapses WHERE synapse_type='fixed'").fetchone()[0]
+    n_dev = conn.execute("SELECT COUNT(*) FROM synapses WHERE synapse_type='developmental'").fetchone()[0]
 
     conn.close()
 
     print(f"\n  Saved to: {db_path}")
     print(f"  {n} neurons, {n_syn} unique-pair synapses")
-    print(f"  Types: {n_fixed} fixed, {n_plastic} plastic, {n_reward} reward_plastic")
+    type_parts = [f"{n_fixed} fixed"]
+    if n_plastic > 0:
+        type_parts.append(f"{n_plastic} plastic")
+    if n_reward > 0:
+        type_parts.append(f"{n_reward} reward_plastic")
+    if n_dev > 0:
+        type_parts.append(f"{n_dev} developmental")
+    print(f"  Types: {', '.join(type_parts)}")
 
     return db_path
 
