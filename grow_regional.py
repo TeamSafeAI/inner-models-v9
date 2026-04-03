@@ -149,10 +149,6 @@ def place_regional_neurons(n_total, regions, rng):
             z_all.append(cz + dz)
             region_labels.append(rname)
 
-            # Cell type
-            is_exc = rng.random() < exc_ratio
-            cell_types.append('EXC' if is_exc else 'INH')
-
             # Neuron type from region distribution
             r = rng.random()
             cumulative = 0
@@ -163,6 +159,10 @@ def place_regional_neurons(n_total, regions, rng):
                     chosen = ntype
                     break
             neuron_types.append(chosen)
+
+            # Cell type derived from neuron type (FS/LTS = inhibitory)
+            is_exc = chosen not in ('fs', 'lts')
+            cell_types.append('EXC' if is_exc else 'INH')
 
     n = len(x_all)
     print(f"  Placed {n} neurons across {len(regions)} regions:")
@@ -486,20 +486,21 @@ def save_regional_db(neurons, synapses, pair_counts, params, regions_used, db_pa
         src_region = region_labels[src]
         tgt_region = region_labels[tgt]
 
-        # Weight: base scaled by contacts
+        # Weight: base scaled by contacts, sign from neuron type
         if src_exc:
             base_w = 2.0
         else:
-            base_w = -2.5
+            base_w = -2.5  # inhibitory -> negative weight
         weight = base_w * (1.0 + 0.3 * (n_contacts - 1))
 
-        # Synapse type: cross-region excitatory = reward_plastic
-        if src_exc and src_region != tgt_region:
-            syn_type = 'reward_plastic'
-        elif src_exc:
-            syn_type = 'plastic'
-        else:
+        # Synapse type: INH = fixed (inhibition isn't reward-modulated)
+        # EXC cross-region = reward_plastic, EXC local = plastic
+        if not src_exc:
             syn_type = 'fixed'
+        elif src_region != tgt_region:
+            syn_type = 'reward_plastic'
+        else:
+            syn_type = 'plastic'
 
         # Distance-based delay
         d = np.sqrt((neurons['x'][src] - neurons['x'][tgt])**2 +
@@ -507,13 +508,22 @@ def save_regional_db(neurons, synapses, pair_counts, params, regions_used, db_pa
                      (neurons['z'][src] - neurons['z'][tgt])**2)
         delay = max(1, int(d / 50.0))
 
-        params_json = json.dumps({'n_contacts': n_contacts, 'src_region': src_region, 'tgt_region': tgt_region})
+        params_dict = {'n_contacts': n_contacts, 'src_region': src_region, 'tgt_region': tgt_region}
+        # Set w_min/w_max for plastic types based on sign
+        if syn_type in ('plastic', 'reward_plastic'):
+            if weight < 0:
+                params_dict['w_min'] = -10.0
+                params_dict['w_max'] = 0.0
+            else:
+                params_dict['w_min'] = 0.0
+                params_dict['w_max'] = 10.0
+        params_json = json.dumps(params_dict)
 
         conn.execute(
             """INSERT INTO synapses
                (source, target, synapse_type, weight, delay, params, state)
                VALUES (?, ?, ?, ?, ?, ?, '{}')""",
-            (idx_to_id[src], idx_to_id[tgt], syn_type, abs(weight), delay, params_json)
+            (idx_to_id[src], idx_to_id[tgt], syn_type, weight, delay, params_json)
         )
 
     conn.commit()
