@@ -193,7 +193,7 @@ def generate_noise_pattern(channels, rng):
 def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
                     sensory_gain=6.0, sessions=1, report_interval=5000,
                     structure_mode='steep', explicit_reward=False,
-                    curriculum=False):
+                    curriculum=False, balanced_stdp=False):
     """Run free-energy arena simulation."""
 
     print(f"{'='*70}")
@@ -212,6 +212,20 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
     brain = Brain(data, learn=True)
     n = brain.n
     rng = np.random.RandomState(seed)
+
+    # Balanced STDP: narrow w_max to 2x current weight
+    # Fixes LTP/LTD asymmetry (8:1 -> 2:1 for plastic, 4:1 -> 1:1 for reward)
+    if balanced_stdp:
+        if len(brain.plastic_w_arr) > 0:
+            brain.plastic_wmax_arr[:] = np.maximum(brain.plastic_w_arr * 2.0, 0.1)
+            # Also scale wmin for inhibitory
+            inh = brain.plastic_is_inh
+            brain.plastic_wmin_arr[inh] = np.minimum(brain.plastic_w_arr[inh] * 2.0, -0.1)
+        if len(brain.reward_w_arr) > 0:
+            brain.reward_wmax_arr[:] = np.maximum(brain.reward_w_arr * 2.0, 0.1)
+            inh_r = brain.reward_is_inh
+            brain.reward_wmin_arr[inh_r] = np.minimum(brain.reward_w_arr[inh_r] * 2.0, -0.1)
+        print(f"  BALANCED STDP: w_max = 2x current weight")
 
     print(f"  Brain: {n}N, {len(data['synapses'])} synapses")
 
@@ -364,13 +378,13 @@ def run_free_energy(db_path, ticks=60000, seed=42, tonic=2.8,
             body.pos = arena.clamp_to_boundary(body.pos)
 
             # Optional explicit reward (hybrid mode)
-            # Reward based on distance change to food (more sensitive than concentration)
-            if explicit_reward and tick % 100 == 99:
+            # Binary reward based on movement toward/away from food
+            if explicit_reward and tick % 50 == 49:
                 new_dist = np.sqrt((body.pos[0] - food_x)**2 + (body.pos[1] - food_y)**2)
                 dd = prev_dist - new_dist  # positive = getting closer
-                if abs(dd) > 0.001:
-                    # Scale: dd=0.1 (big move toward) -> reward=0.5
-                    reward = float(np.clip(dd * 5.0, -1.0, 1.0))
+                if abs(dd) > 0.0005:
+                    # Binary: strong signal regardless of magnitude
+                    reward = 0.3 if dd > 0 else -0.3
                     brain.deliver_reward(reward)
                     reward_total += reward
                     reward_count += 1
@@ -507,13 +521,16 @@ def main():
                    help='Add explicit reward on top of free energy (hybrid mode)')
     p.add_argument('--curriculum', action='store_true',
                    help='Start close to food, gradually increase distance across sessions')
+    p.add_argument('--balanced', action='store_true',
+                   help='Narrow w_max to 2x weight for balanced LTP/LTD')
     args = p.parse_args()
 
     run_free_energy(
         args.brain, ticks=args.ticks, seed=args.seed,
         tonic=args.tonic, sensory_gain=args.sensory_gain,
         sessions=args.sessions, structure_mode=args.structure_mode,
-        explicit_reward=args.reward, curriculum=args.curriculum)
+        explicit_reward=args.reward, curriculum=args.curriculum,
+        balanced_stdp=args.balanced)
 
 
 if __name__ == '__main__':

@@ -624,13 +624,16 @@ def save_regional_db(neurons, synapses, pair_counts, params, regions_used, db_pa
 
         params_dict = {'n_contacts': n_contacts, 'src_region': src_region, 'tgt_region': tgt_region}
         # Set w_min/w_max for plastic types based on sign
+        # w_max must be close to starting weight for balanced STDP:
+        # At w=2.0, w_max=4.0 gives reward balance (positive/negative 1:1)
+        # and STDP balance (LTP/LTD 2:1 with ltd_ratio=0.5, vs 8:1 at w_max=10)
         if syn_type in ('plastic', 'reward_plastic', 'developmental'):
             if weight < 0:
-                params_dict['w_min'] = -10.0
+                params_dict['w_min'] = -abs(weight) * 2.0
                 params_dict['w_max'] = 0.0
             else:
                 params_dict['w_min'] = 0.0
-                params_dict['w_max'] = 10.0
+                params_dict['w_max'] = abs(weight) * 2.0
         # Developmental: longer critical period for complex brains
         if syn_type == 'developmental':
             params_dict['critical_period'] = 30000   # 30K ticks to prove worth
