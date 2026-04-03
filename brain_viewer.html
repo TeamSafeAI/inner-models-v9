@@ -23,6 +23,34 @@ body { background: #111; color: #ccc; font-family: monospace; overflow: hidden; 
     display: inline-block; height: 8px; border-radius: 2px;
     margin-right: 4px; vertical-align: middle; transition: width 0.1s;
 }
+#io-panel {
+    position: absolute; top: 230px; left: 10px; z-index: 10;
+    background: rgba(0,0,0,0.7); padding: 12px; border-radius: 6px;
+    font-size: 12px; min-width: 210px;
+}
+#io-panel button {
+    background: #333; color: #ccc; border: 1px solid #555; padding: 3px 10px;
+    border-radius: 3px; cursor: pointer; font-family: monospace; font-size: 11px;
+}
+#io-panel button:hover { background: #444; }
+#io-panel button.active { background: #2a5; color: #fff; border-color: #3b6; }
+.level-bar {
+    display: inline-block; width: 80px; height: 8px; background: #222;
+    border-radius: 2px; vertical-align: middle; margin-left: 6px;
+    overflow: hidden;
+}
+.level-fill {
+    height: 100%; border-radius: 2px; transition: width 0.05s;
+}
+#cam-preview {
+    display: none; margin-top: 4px; border: 1px solid #333;
+    image-rendering: pixelated; width: 64px; height: 64px;
+}
+#motor-panel {
+    position: absolute; top: 280px; right: 10px; z-index: 10;
+    background: rgba(0,0,0,0.7); padding: 12px; border-radius: 6px;
+    font-size: 12px; min-width: 180px;
+}
 #controls {
     position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
     z-index: 10; background: rgba(0,0,0,0.7); padding: 8px 16px;
@@ -56,6 +84,37 @@ body { background: #111; color: #ccc; font-family: monospace; overflow: hidden; 
     <div><span class="label">Speed: </span><span class="value" id="speed">1.0</span></div>
 </div>
 <div id="types"></div>
+
+<div id="io-panel">
+    <div style="font-weight:bold;margin-bottom:6px">I/O Electrodes</div>
+    <div style="margin-bottom:4px">
+        <button id="mic-btn" onclick="toggleMic()">Mic OFF</button>
+        <div class="level-bar"><div class="level-fill" id="mic-fill" style="width:0%;background:#2a5"></div></div>
+        <span style="color:#555;font-size:10px" id="mic-info">64 freq bands</span>
+    </div>
+    <div style="margin-bottom:4px">
+        <button id="cam-btn" onclick="toggleCam()">Cam OFF</button>
+        <div class="level-bar"><div class="level-fill" id="cam-fill" style="width:0%;background:#47a"></div></div>
+        <span style="color:#555;font-size:10px">16x16 px</span>
+    </div>
+    <canvas id="cam-preview"></canvas>
+    <div style="margin-top:6px;color:#666;font-size:10px">
+        Shift+Click = Touch probe
+    </div>
+    <div style="margin-top:2px">
+        <span style="color:#888">Probe mA:</span>
+        <input type="range" id="touch-str" min="1" max="30" step="1" value="15"
+               style="width:70px;vertical-align:middle">
+        <span id="touch-val" style="color:#888">15</span>
+    </div>
+</div>
+
+<div id="motor-panel">
+    <div style="font-weight:bold;margin-bottom:4px">Motor Output</div>
+    <canvas id="motor-canvas" width="160" height="64"></canvas>
+    <div style="color:#555;font-size:10px;margin-top:2px">32 readout electrodes</div>
+</div>
+
 <div id="controls">
     <button onclick="send({action:'pause'})">Pause/Resume</button>
     <span style="color:#888">Speed:</span>
@@ -76,18 +135,40 @@ let neurons = [];
 let nNeurons = 0;
 let typeColors = {};
 let typeCounts = {};
+let electrodes = {};
 let scene, camera, renderer, controls;
 let neuronPoints = null;
 let neuronColors = null;
 let neuronSizes = null;
 let baseColors = null;
-let glowDecay = null;  // per-neuron glow level (decays over time)
-let eegHistory = {};    // type -> array of firing rates
-const EEG_LEN = 300;   // frames of history
+let baseSizeArr = null;
+let glowDecay = null;
+let eegHistory = {};
+const EEG_LEN = 300;
 const GLOW_DECAY = 0.85;
 const GLOW_BOOST = 1.0;
 const BASE_SIZE = 2.0;
 const GLOW_SIZE = 6.0;
+const ELECTRODE_SIZE = 3.0;
+
+// I/O state
+let micActive = false;
+let camActive = false;
+let audioCtx = null;
+let analyser = null;
+let micStream = null;
+let camStream = null;
+let videoEl = null;
+let camSmall = null;
+let camSmallCtx = null;
+
+// Touch strength display
+document.addEventListener('DOMContentLoaded', () => {
+    const ts = document.getElementById('touch-str');
+    if (ts) ts.oninput = () => {
+        document.getElementById('touch-val').textContent = ts.value;
+    };
+});
 
 // --- WebSocket ---
 function connect() {
@@ -112,22 +193,161 @@ function send(obj) {
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
+// --- Microphone ---
+async function toggleMic() {
+    const btn = document.getElementById('mic-btn');
+    if (!micActive) {
+        try {
+            audioCtx = new AudioContext();
+            micStream = await navigator.mediaDevices.getUserMedia({audio: true});
+            const source = audioCtx.createMediaStreamSource(micStream);
+            analyser = audioCtx.createAnalyser();
+            analyser.fftSize = 128;  // 64 frequency bins
+            source.connect(analyser);
+            micActive = true;
+            btn.textContent = 'Mic ON';
+            btn.classList.add('active');
+        } catch(e) {
+            console.error('Mic error:', e);
+        }
+    } else {
+        micActive = false;
+        // Send zeros to clear residual input
+        send({action: 'audio', fft: new Array(64).fill(0)});
+        if (micStream) micStream.getTracks().forEach(t => t.stop());
+        if (audioCtx) audioCtx.close();
+        analyser = null;
+        btn.textContent = 'Mic OFF';
+        btn.classList.remove('active');
+        document.getElementById('mic-fill').style.width = '0%';
+    }
+}
+
+function getAudioFFT() {
+    if (!analyser) return null;
+    const raw = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteFrequencyData(raw);
+    const fft = [];
+    let peak = 0;
+    for (let i = 0; i < raw.length; i++) {
+        const v = raw[i] / 255;
+        fft.push(v);
+        if (v > peak) peak = v;
+    }
+    document.getElementById('mic-fill').style.width = Math.round(peak * 100) + '%';
+    return fft;
+}
+
+// --- Camera ---
+async function toggleCam() {
+    const btn = document.getElementById('cam-btn');
+    const preview = document.getElementById('cam-preview');
+    if (!camActive) {
+        try {
+            camStream = await navigator.mediaDevices.getUserMedia({video: true});
+            videoEl = document.createElement('video');
+            videoEl.srcObject = camStream;
+            videoEl.play();
+            // Small canvas for 16x16 downsampling
+            camSmall = document.createElement('canvas');
+            camSmall.width = 16;
+            camSmall.height = 16;
+            camSmallCtx = camSmall.getContext('2d');
+            camActive = true;
+            btn.textContent = 'Cam ON';
+            btn.classList.add('active');
+            preview.style.display = 'block';
+        } catch(e) {
+            console.error('Camera error:', e);
+        }
+    } else {
+        camActive = false;
+        send({action: 'visual', pixels: new Array(256).fill(0)});
+        if (camStream) camStream.getTracks().forEach(t => t.stop());
+        videoEl = null;
+        btn.textContent = 'Cam OFF';
+        btn.classList.remove('active');
+        document.getElementById('cam-preview').style.display = 'none';
+        document.getElementById('cam-fill').style.width = '0%';
+    }
+}
+
+function getVisualPixels() {
+    if (!camSmallCtx || !videoEl || videoEl.readyState < 2) return null;
+    // Downsample to 16x16
+    camSmallCtx.drawImage(videoEl, 0, 0, 16, 16);
+    const imgData = camSmallCtx.getImageData(0, 0, 16, 16);
+    const pixels = [];
+    let total = 0;
+    for (let i = 0; i < 256; i++) {
+        const r = imgData.data[i * 4];
+        const g = imgData.data[i * 4 + 1];
+        const b = imgData.data[i * 4 + 2];
+        const gray = (r * 0.299 + g * 0.587 + b * 0.114) / 255;
+        pixels.push(gray);
+        total += gray;
+    }
+    // Update preview (larger for visibility)
+    const preview = document.getElementById('cam-preview');
+    const pCtx = preview.getContext('2d');
+    preview.width = 64;
+    preview.height = 64;
+    pCtx.drawImage(videoEl, 0, 0, 64, 64);
+    // Level bar
+    document.getElementById('cam-fill').style.width = Math.round((total / 256) * 100) + '%';
+    return pixels;
+}
+
+// --- I/O streaming at ~30fps ---
+setInterval(() => {
+    if (micActive) {
+        const fft = getAudioFFT();
+        if (fft) send({action: 'audio', fft: fft});
+    }
+    if (camActive) {
+        const px = getVisualPixels();
+        if (px) send({action: 'visual', pixels: px});
+    }
+}, 33);
+
+// --- Touch probe (Shift+Click) ---
+function onCanvasClick(event) {
+    if (!event.shiftKey || !neuronPoints) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    const mouse = new THREE.Vector2(
+        ((event.clientX - rect.left) / rect.width) * 2 - 1,
+        -((event.clientY - rect.top) / rect.height) * 2 + 1
+    );
+    const raycaster = new THREE.Raycaster();
+    raycaster.params.Points.threshold = 15;
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObject(neuronPoints);
+    if (intersects.length > 0) {
+        const idx = intersects[0].index;
+        const strength = parseFloat(document.getElementById('touch-str').value);
+        send({action: 'touch', idx: idx, strength: strength});
+        // Bright flash on touched neuron
+        glowDecay[idx] = 2.0;
+    }
+}
+
 // --- Config: build 3D scene ---
 function onConfig(data) {
     nNeurons = data.n_neurons;
     neurons = data.neurons;
     typeColors = data.type_colors;
     typeCounts = data.type_counts;
+    electrodes = data.electrodes || {};
 
     document.getElementById('n-neurons').textContent = nNeurons;
     document.getElementById('n-synapses').textContent = data.n_synapses;
 
-    // Init EEG history per type
+    // EEG history per type
     for (const t of Object.keys(typeColors)) {
         eegHistory[t] = new Float32Array(EEG_LEN);
     }
 
-    // Build neuron type legend
+    // Neuron type legend
     const typesDiv = document.getElementById('types');
     typesDiv.innerHTML = '<div style="font-weight:bold;margin-bottom:4px">Neuron Types</div>';
     const typeLabels = {RS:'Regular Spiking', FS:'Fast Spiking (inh)', IB:'Intrinsic Burst',
@@ -149,11 +369,10 @@ function onConfig(data) {
 }
 
 function buildScene() {
-    // Three.js setup
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x111111);
 
-    // Compute center of mass for camera target
+    // Center of mass for camera target
     let cx = 0, cy = 0, cz = 0;
     for (const n of neurons) { cx += n.x; cy += n.y; cz += n.z; }
     cx /= nNeurons; cy /= nNeurons; cz /= nNeurons;
@@ -167,18 +386,27 @@ function buildScene() {
     document.body.insertBefore(renderer.domElement, document.body.firstChild);
     renderer.domElement.id = 'canvas';
 
+    // Touch handler
+    renderer.domElement.addEventListener('click', onCanvasClick);
+
     controls = new THREE.OrbitControls(camera, renderer.domElement);
     controls.target.set(cx, cy, cz);
     controls.enableDamping = true;
     controls.dampingFactor = 0.1;
     controls.update();
 
-    // Point cloud for neurons
+    // Electrode lookup sets
+    const audioSet = new Set(electrodes.audio || []);
+    const visualSet = new Set(electrodes.visual || []);
+    const motorSet = new Set(electrodes.motor || []);
+
+    // Point cloud
     const geometry = new THREE.BufferGeometry();
     const positions = new Float32Array(nNeurons * 3);
     neuronColors = new Float32Array(nNeurons * 3);
     baseColors = new Float32Array(nNeurons * 3);
     neuronSizes = new Float32Array(nNeurons);
+    baseSizeArr = new Float32Array(nNeurons);
     glowDecay = new Float32Array(nNeurons);
 
     for (let i = 0; i < nNeurons; i++) {
@@ -188,7 +416,6 @@ function buildScene() {
         positions[i*3+2] = n.z;
 
         const c = n.color;
-        // INH neurons slightly dimmer at rest
         const dim = n.inh ? 0.4 : 0.5;
         baseColors[i*3] = c[0] * dim;
         baseColors[i*3+1] = c[1] * dim;
@@ -196,14 +423,20 @@ function buildScene() {
         neuronColors[i*3] = baseColors[i*3];
         neuronColors[i*3+1] = baseColors[i*3+1];
         neuronColors[i*3+2] = baseColors[i*3+2];
-        neuronSizes[i] = n.inh ? BASE_SIZE * 0.7 : BASE_SIZE;
+
+        // Electrode neurons slightly bigger so you can see where probes are
+        let size = n.inh ? BASE_SIZE * 0.7 : BASE_SIZE;
+        if (audioSet.has(i) || visualSet.has(i) || motorSet.has(i)) {
+            size = ELECTRODE_SIZE;
+        }
+        baseSizeArr[i] = size;
+        neuronSizes[i] = size;
     }
 
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geometry.setAttribute('color', new THREE.BufferAttribute(neuronColors, 3));
     geometry.setAttribute('size', new THREE.BufferAttribute(neuronSizes, 1));
 
-    // Custom shader for variable-size points with glow
     const material = new THREE.ShaderMaterial({
         vertexColors: true,
         transparent: true,
@@ -233,12 +466,10 @@ function buildScene() {
     neuronPoints = new THREE.Points(geometry, material);
     scene.add(neuronPoints);
 
-    // Subtle axis indicator
     const axisHelper = new THREE.AxesHelper(50);
     axisHelper.position.set(cx - 200, cy - 200, cz - 200);
     scene.add(axisHelper);
 
-    // Light ambient glow
     scene.add(new THREE.AmbientLight(0x222222));
 
     window.addEventListener('resize', () => {
@@ -250,7 +481,7 @@ function buildScene() {
     animate();
 }
 
-// --- Frame: update glow ---
+// --- Frame: update glow + I/O displays ---
 function onFrame(data) {
     if (!neuronPoints) return;
 
@@ -259,7 +490,7 @@ function onFrame(data) {
     document.getElementById('tonic').textContent = (data.tonic || 2.8).toFixed(1);
     document.getElementById('speed').textContent = (data.speed || 1.0).toFixed(1);
 
-    // Decay existing glow
+    // Decay glow
     for (let i = 0; i < nNeurons; i++) {
         glowDecay[i] *= GLOW_DECAY;
     }
@@ -271,31 +502,29 @@ function onFrame(data) {
         }
     }
 
-    // Update colors and sizes based on glow
+    // Update colors and sizes
     const colors = neuronPoints.geometry.attributes.color.array;
     const sizes = neuronPoints.geometry.attributes.size.array;
     for (let i = 0; i < nNeurons; i++) {
         const g = glowDecay[i];
-        const n = neurons[i];
         if (g > 0.05) {
-            // Glow: blend toward bright white/yellow
             const glow = Math.min(g, 1.0);
             colors[i*3]   = baseColors[i*3]   + (1.0 - baseColors[i*3])   * glow;
             colors[i*3+1] = baseColors[i*3+1] + (0.95 - baseColors[i*3+1]) * glow;
             colors[i*3+2] = baseColors[i*3+2] + (0.6 - baseColors[i*3+2]) * glow * 0.5;
-            sizes[i] = (n.inh ? BASE_SIZE * 0.7 : BASE_SIZE) + GLOW_SIZE * glow;
+            sizes[i] = baseSizeArr[i] + GLOW_SIZE * glow;
         } else {
             colors[i*3]   = baseColors[i*3];
             colors[i*3+1] = baseColors[i*3+1];
             colors[i*3+2] = baseColors[i*3+2];
-            sizes[i] = n.inh ? BASE_SIZE * 0.7 : BASE_SIZE;
+            sizes[i] = baseSizeArr[i];
             glowDecay[i] = 0;
         }
     }
     neuronPoints.geometry.attributes.color.needsUpdate = true;
     neuronPoints.geometry.attributes.size.needsUpdate = true;
 
-    // Update type bars and EEG
+    // Type bars and EEG
     const typeFire = data.type_fire || {};
     for (const [t, color] of Object.entries(typeColors)) {
         const count = typeFire[t] || 0;
@@ -305,18 +534,47 @@ function onFrame(data) {
         const fireEl = document.getElementById('fire-' + t);
         if (barEl) barEl.style.width = Math.round(pct * 100) + 'px';
         if (fireEl) fireEl.textContent = count;
-
-        // EEG history
         if (eegHistory[t]) {
             eegHistory[t].copyWithin(0, 1);
             eegHistory[t][EEG_LEN - 1] = pct;
         }
     }
 
+    // Motor output
+    drawMotor(data.motor || []);
+
     drawEEG();
 }
 
-// --- EEG trace ---
+// --- Motor output: 8x4 heat grid ---
+function drawMotor(motor) {
+    const canvas = document.getElementById('motor-canvas');
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    if (!motor.length) return;
+
+    const cols = 8;
+    const rows = Math.ceil(motor.length / cols);
+    const cellW = w / cols;
+    const cellH = h / rows;
+    const maxFire = Math.max(1, ...motor);
+
+    for (let i = 0; i < motor.length; i++) {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const val = motor[i] / maxFire;
+        // Orange glow for motor activity
+        const r = Math.round(30 + val * 225);
+        const g = Math.round(20 + val * 150);
+        const b = Math.round(10 + val * 30);
+        ctx.fillStyle = `rgb(${r},${g},${b})`;
+        ctx.fillRect(col * cellW + 1, row * cellH + 1, cellW - 2, cellH - 2);
+    }
+}
+
+// --- EEG trace per neuron type ---
 function drawEEG() {
     const canvas = document.getElementById('eeg-canvas');
     const ctx = canvas.getContext('2d');
@@ -331,9 +589,9 @@ function drawEEG() {
     const rowH = h / nTypes;
 
     for (let ri = 0; ri < nTypes; ri++) {
-        const r = typeNames[ri];
-        const color = typeColors[r];
-        const hist = eegHistory[r];
+        const t = typeNames[ri];
+        const color = typeColors[t];
+        const hist = eegHistory[t];
         if (!hist) continue;
 
         const y0 = ri * rowH;
@@ -343,7 +601,6 @@ function drawEEG() {
 
         for (let i = 0; i < EEG_LEN; i++) {
             const x = (i / EEG_LEN) * w;
-            // Scale: 0-30% firing rate fills the row
             const val = Math.min(hist[i] / 0.3, 1.0);
             const y = y0 + rowH - val * rowH * 0.8 - rowH * 0.1;
             if (i === 0) ctx.moveTo(x, y);
@@ -351,10 +608,9 @@ function drawEEG() {
         }
         ctx.stroke();
 
-        // Region label
         ctx.fillStyle = ctx.strokeStyle;
         ctx.font = '9px monospace';
-        ctx.fillText(r, 4, y0 + 10);
+        ctx.fillText(t, 4, y0 + 10);
     }
 }
 
