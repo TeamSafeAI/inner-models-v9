@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Brain Activity Viewer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #111; color: #ccc; font-family: monospace; overflow: hidden; }
+#canvas { position: absolute; top: 0; left: 0; }
+#hud {
+    position: absolute; top: 10px; left: 10px; z-index: 10;
+    background: rgba(0,0,0,0.7); padding: 12px; border-radius: 6px;
+    font-size: 13px; line-height: 1.6; min-width: 220px;
+}
+#hud .label { color: #888; }
+#hud .value { color: #eee; font-weight: bold; }
+#types {
+    position: absolute; top: 10px; right: 10px; z-index: 10;
+    background: rgba(0,0,0,0.7); padding: 12px; border-radius: 6px;
+    font-size: 12px; line-height: 1.8; min-width: 180px;
+}
+.type-bar {
+    display: inline-block; height: 8px; border-radius: 2px;
+    margin-right: 4px; vertical-align: middle; transition: width 0.1s;
+}
+#controls {
+    position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+    z-index: 10; background: rgba(0,0,0,0.7); padding: 8px 16px;
+    border-radius: 6px; font-size: 12px;
+}
+#controls button {
+    background: #333; color: #ccc; border: 1px solid #555; padding: 4px 12px;
+    margin: 0 4px; border-radius: 3px; cursor: pointer; font-family: monospace;
+}
+#controls button:hover { background: #444; }
+#controls input[type=range] { vertical-align: middle; width: 100px; }
+#eeg {
+    position: absolute; bottom: 60px; left: 10px; right: 10px; z-index: 10;
+    background: rgba(0,0,0,0.5); border-radius: 6px; height: 120px;
+}
+#eeg canvas { width: 100%; height: 100%; }
+#status {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    z-index: 20; font-size: 18px; color: #888;
+}
+</style>
+</head>
+<body>
+<div id="status">Connecting...</div>
+<div id="hud">
+    <div><span class="label">Tick: </span><span class="value" id="tick">0</span></div>
+    <div><span class="label">Neurons: </span><span class="value" id="n-neurons">-</span></div>
+    <div><span class="label">Synapses: </span><span class="value" id="n-synapses">-</span></div>
+    <div><span class="label">Firing: </span><span class="value" id="n-fired">0</span></div>
+    <div><span class="label">Tonic: </span><span class="value" id="tonic">2.8</span></div>
+    <div><span class="label">Speed: </span><span class="value" id="speed">1.0</span></div>
+</div>
+<div id="types"></div>
+<div id="controls">
+    <button onclick="send({action:'pause'})">Pause/Resume</button>
+    <span style="color:#888">Speed:</span>
+    <input type="range" id="speed-slider" min="0.1" max="10" step="0.1" value="1.0"
+           oninput="send({action:'speed',value:parseFloat(this.value)})">
+    <span style="color:#888">Tonic:</span>
+    <input type="range" id="tonic-slider" min="0" max="5" step="0.1" value="2.8"
+           oninput="send({action:'tonic',value:parseFloat(this.value)})">
+</div>
+<div id="eeg"><canvas id="eeg-canvas"></canvas></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+// --- State ---
+let ws = null;
+let neurons = [];
+let nNeurons = 0;
+let typeColors = {};
+let typeCounts = {};
+let scene, camera, renderer, controls;
+let neuronPoints = null;
+let neuronColors = null;
+let neuronSizes = null;
+let baseColors = null;
+let glowDecay = null;  // per-neuron glow level (decays over time)
+let eegHistory = {};    // type -> array of firing rates
+const EEG_LEN = 300;   // frames of history
+const GLOW_DECAY = 0.85;
+const GLOW_BOOST = 1.0;
+const BASE_SIZE = 2.0;
+const GLOW_SIZE = 6.0;
+
+// --- WebSocket ---
+function connect() {
+    const port = location.port ? parseInt(location.port) + 1 : 8891;
+    ws = new WebSocket('ws://localhost:' + port);
+    ws.onopen = () => {
+        document.getElementById('status').style.display = 'none';
+    };
+    ws.onclose = () => {
+        document.getElementById('status').textContent = 'Disconnected. Reconnecting...';
+        document.getElementById('status').style.display = 'block';
+        setTimeout(connect, 2000);
+    };
+    ws.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        if (data.type === 'config') onConfig(data);
+        else if (data.type === 'frame') onFrame(data);
+    };
+}
+
+function send(obj) {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+}
+
+// --- Config: build 3D scene ---
+function onConfig(data) {
+    nNeurons = data.n_neurons;
+    neurons = data.neurons;
+    typeColors = data.type_colors;
+    typeCounts = data.type_counts;
+
+    document.getElementById('n-neurons').textContent = nNeurons;
+    document.getElementById('n-synapses').textContent = data.n_synapses;
+
+    // Init EEG history per type
+    for (const t of Object.keys(typeColors)) {
+        eegHistory[t] = new Float32Array(EEG_LEN);
+    }
+
+    // Build neuron type legend
+    const typesDiv = document.getElementById('types');
+    typesDiv.innerHTML = '<div style="font-weight:bold;margin-bottom:4px">Neuron Types</div>';
+    const typeLabels = {RS:'Regular Spiking', FS:'Fast Spiking (inh)', IB:'Intrinsic Burst',
+                        CH:'Chattering', LTS:'Low-Threshold (inh)'};
+    for (const [t, color] of Object.entries(typeColors)) {
+        const c = `rgb(${Math.round(color[0]*255)},${Math.round(color[1]*255)},${Math.round(color[2]*255)})`;
+        const count = typeCounts[t] || 0;
+        const label = typeLabels[t] || t;
+        typesDiv.innerHTML += `<div>
+            <span class="type-bar" id="bar-${t}" style="background:${c};width:0px"></span>
+            <span style="color:${c}">${t}</span>
+            <span style="color:#555">${label}</span>
+            <span style="color:#666">(${count})</span>
+            <span style="color:#888" id="fire-${t}">0</span>
+        </div>`;
+    }
+
+    buildScene();
+}
+
+function buildScene() {
+    // Three.js setup
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x111111);
+
+    // Compute center of mass for camera target
+    let cx = 0, cy = 0, cz = 0;
+    for (const n of neurons) { cx += n.x; cy += n.y; cz += n.z; }
+    cx /= nNeurons; cy /= nNeurons; cz /= nNeurons;
+
+    camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, 5000);
+    camera.position.set(cx + 400, cy + 300, cz + 400);
+
+    renderer = new THREE.WebGLRenderer({ canvas: document.createElement('canvas'), antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    document.body.insertBefore(renderer.domElement, document.body.firstChild);
+    renderer.domElement.id = 'canvas';
+
+    controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.target.set(cx, cy, cz);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.1;
+    controls.update();
+
+    // Point cloud for neurons
+    const geometry = new THREE.BufferGeometry();
+    const positions = new Float32Array(nNeurons * 3);
+    neuronColors = new Float32Array(nNeurons * 3);
+    baseColors = new Float32Array(nNeurons * 3);
+    neuronSizes = new Float32Array(nNeurons);
+    glowDecay = new Float32Array(nNeurons);
+
+    for (let i = 0; i < nNeurons; i++) {
+        const n = neurons[i];
+        positions[i*3] = n.x;
+        positions[i*3+1] = n.y;
+        positions[i*3+2] = n.z;
+
+        const c = n.color;
+        // INH neurons slightly dimmer at rest
+        const dim = n.inh ? 0.4 : 0.5;
+        baseColors[i*3] = c[0] * dim;
+        baseColors[i*3+1] = c[1] * dim;
+        baseColors[i*3+2] = c[2] * dim;
+        neuronColors[i*3] = baseColors[i*3];
+        neuronColors[i*3+1] = baseColors[i*3+1];
+        neuronColors[i*3+2] = baseColors[i*3+2];
+        neuronSizes[i] = n.inh ? BASE_SIZE * 0.7 : BASE_SIZE;
+    }
+
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(neuronColors, 3));
+    geometry.setAttribute('size', new THREE.BufferAttribute(neuronSizes, 1));
+
+    // Custom shader for variable-size points with glow
+    const material = new THREE.ShaderMaterial({
+        vertexColors: true,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        vertexShader: `
+            attribute float size;
+            varying vec3 vColor;
+            void main() {
+                vColor = color;
+                vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+                gl_PointSize = size * (300.0 / -mvPos.z);
+                gl_Position = projectionMatrix * mvPos;
+            }
+        `,
+        fragmentShader: `
+            varying vec3 vColor;
+            void main() {
+                float d = length(gl_PointCoord - 0.5) * 2.0;
+                if (d > 1.0) discard;
+                float alpha = 1.0 - d * d;
+                gl_FragColor = vec4(vColor, alpha * 0.8);
+            }
+        `,
+    });
+
+    neuronPoints = new THREE.Points(geometry, material);
+    scene.add(neuronPoints);
+
+    // Subtle axis indicator
+    const axisHelper = new THREE.AxesHelper(50);
+    axisHelper.position.set(cx - 200, cy - 200, cz - 200);
+    scene.add(axisHelper);
+
+    // Light ambient glow
+    scene.add(new THREE.AmbientLight(0x222222));
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    animate();
+}
+
+// --- Frame: update glow ---
+function onFrame(data) {
+    if (!neuronPoints) return;
+
+    document.getElementById('tick').textContent = data.tick;
+    document.getElementById('n-fired').textContent = data.n_fired;
+    document.getElementById('tonic').textContent = (data.tonic || 2.8).toFixed(1);
+    document.getElementById('speed').textContent = (data.speed || 1.0).toFixed(1);
+
+    // Decay existing glow
+    for (let i = 0; i < nNeurons; i++) {
+        glowDecay[i] *= GLOW_DECAY;
+    }
+
+    // Boost fired neurons
+    if (data.fired) {
+        for (const fi of data.fired) {
+            glowDecay[fi] = GLOW_BOOST;
+        }
+    }
+
+    // Update colors and sizes based on glow
+    const colors = neuronPoints.geometry.attributes.color.array;
+    const sizes = neuronPoints.geometry.attributes.size.array;
+    for (let i = 0; i < nNeurons; i++) {
+        const g = glowDecay[i];
+        const n = neurons[i];
+        if (g > 0.05) {
+            // Glow: blend toward bright white/yellow
+            const glow = Math.min(g, 1.0);
+            colors[i*3]   = baseColors[i*3]   + (1.0 - baseColors[i*3])   * glow;
+            colors[i*3+1] = baseColors[i*3+1] + (0.95 - baseColors[i*3+1]) * glow;
+            colors[i*3+2] = baseColors[i*3+2] + (0.6 - baseColors[i*3+2]) * glow * 0.5;
+            sizes[i] = (n.inh ? BASE_SIZE * 0.7 : BASE_SIZE) + GLOW_SIZE * glow;
+        } else {
+            colors[i*3]   = baseColors[i*3];
+            colors[i*3+1] = baseColors[i*3+1];
+            colors[i*3+2] = baseColors[i*3+2];
+            sizes[i] = n.inh ? BASE_SIZE * 0.7 : BASE_SIZE;
+            glowDecay[i] = 0;
+        }
+    }
+    neuronPoints.geometry.attributes.color.needsUpdate = true;
+    neuronPoints.geometry.attributes.size.needsUpdate = true;
+
+    // Update type bars and EEG
+    const typeFire = data.type_fire || {};
+    for (const [t, color] of Object.entries(typeColors)) {
+        const count = typeFire[t] || 0;
+        const total = typeCounts[t] || 1;
+        const pct = count / total;
+        const barEl = document.getElementById('bar-' + t);
+        const fireEl = document.getElementById('fire-' + t);
+        if (barEl) barEl.style.width = Math.round(pct * 100) + 'px';
+        if (fireEl) fireEl.textContent = count;
+
+        // EEG history
+        if (eegHistory[t]) {
+            eegHistory[t].copyWithin(0, 1);
+            eegHistory[t][EEG_LEN - 1] = pct;
+        }
+    }
+
+    drawEEG();
+}
+
+// --- EEG trace ---
+function drawEEG() {
+    const canvas = document.getElementById('eeg-canvas');
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width = canvas.parentElement.clientWidth;
+    const h = canvas.height = canvas.parentElement.clientHeight;
+
+    ctx.clearRect(0, 0, w, h);
+    ctx.globalAlpha = 0.8;
+
+    const typeNames = Object.keys(typeColors);
+    const nTypes = typeNames.length;
+    const rowH = h / nTypes;
+
+    for (let ri = 0; ri < nTypes; ri++) {
+        const r = typeNames[ri];
+        const color = typeColors[r];
+        const hist = eegHistory[r];
+        if (!hist) continue;
+
+        const y0 = ri * rowH;
+        ctx.strokeStyle = `rgb(${Math.round(color[0]*255)},${Math.round(color[1]*255)},${Math.round(color[2]*255)})`;
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+
+        for (let i = 0; i < EEG_LEN; i++) {
+            const x = (i / EEG_LEN) * w;
+            // Scale: 0-30% firing rate fills the row
+            const val = Math.min(hist[i] / 0.3, 1.0);
+            const y = y0 + rowH - val * rowH * 0.8 - rowH * 0.1;
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+
+        // Region label
+        ctx.fillStyle = ctx.strokeStyle;
+        ctx.font = '9px monospace';
+        ctx.fillText(r, 4, y0 + 10);
+    }
+}
+
+// --- Render loop ---
+function animate() {
+    requestAnimationFrame(animate);
+    if (controls) controls.update();
+    if (renderer && scene && camera) {
+        renderer.render(scene, camera);
+    }
+}
+
+// --- Start ---
+connect();
+</script>
+</body>
+</html>
